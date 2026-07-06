@@ -269,11 +269,20 @@ def cmd_bench(a):
 
 def cmd_convert(a):
     banner("convert")
-    cmd=[sys.executable, os.path.join(HERE,"convert_fp8_to_int4.py"),
-         "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits)]
-    if a.xbits: cmd+=["--xbits",str(a.xbits)]
-    print(f"  {C.dim}{' '.join(cmd)}{C.r}")
-    sys.exit(subprocess.call(cmd))
+    # python con torch/safetensors: l'ambiente del progetto se c'e', altrimenti quello corrente
+    venv_py=os.path.join(HERE,"mio_env","bin","python3")
+    py = venv_py if os.path.exists(venv_py) else sys.executable
+    base=[py, os.path.join(HERE,"convert_fp8_to_int4.py"),
+          "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits)]
+    if a.xbits: base+=["--xbits",str(a.xbits)]
+    # passo 1: modello principale (78 layer). Resumabile: riparte dagli shard mancanti.
+    print(f"  {C.dim}[1/2] modello: {' '.join(base)}{C.r}")
+    rc=subprocess.call(base)
+    if rc!=0: sys.exit(rc)
+    if a.no_mtp: sys.exit(0)
+    # passo 2: testa MTP (layer 78) -> abilita la decodifica speculativa nativa (piu' veloce)
+    print(f"  {C.dim}[2/2] testa MTP (draft speculativi){C.r}")
+    sys.exit(subprocess.call(base+["--mtp"]))
 
 def main():
     common=argparse.ArgumentParser(add_help=False)
@@ -290,6 +299,7 @@ def main():
     pb.add_argument("--limit",type=int,default=40); pb.add_argument("--data",default=os.path.join(HERE,"bench"))
     pc=sub.add_parser("convert", parents=[common]); pc.add_argument("--repo",default="zai-org/GLM-5.2-FP8")
     pc.add_argument("--ebits",type=int,default=4); pc.add_argument("--io-bits",type=int,default=8); pc.add_argument("--xbits",type=int,default=0)
+    pc.add_argument("--no-mtp",action="store_true",help="salta la testa MTP (niente draft speculativi)")
     a=ap.parse_args()
     {"build":cmd_build,"info":cmd_info,"run":cmd_run,"chat":cmd_chat,"bench":cmd_bench,
      "convert":cmd_convert}.get(a.cmd, lambda _:(banner(),print(__doc__)))(a)

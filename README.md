@@ -56,14 +56,21 @@ Cold starts are heavy on random reads (~11 GB/token). Reads themselves are safe,
 cd c
 ./setup.sh                      # checks gcc/OpenMP, builds, self-tests
 
-# convert the model (resumable, needs ~400 GB free on a real ext4/NVMe path):
-./coli convert                  # from zai-org/GLM-5.2-FP8
+# ONE command does everything model-side: downloads GLM-5.2-FP8 shard by shard
+# (never needs the full 756 GB at once), converts to the int4 container, then
+# converts the MTP head for speculative decoding. Resumable at any point.
+# Conversion (only) needs python with: pip install torch safetensors huggingface_hub numpy
+./coli convert --model /nvme/glm52_i4     # ~400 GB free on a real ext4/NVMe path
 
-# chat (RAM budget and expert cache size itself automatically):
-COLI_MODEL=/path/to/glm52_i4 ./coli chat
+# chat — RAM budget, expert cache and MTP are all detected automatically:
+COLI_MODEL=/nvme/glm52_i4 ./coli chat
 ```
 
-Useful knobs (env or flags): `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens, `STATS=f`/`PIN=f PIN_GB=g` record expert usage then pin the hottest in RAM, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `TF=1` teacher-forcing validation.
+The engine at runtime is pure C — python is only used by the one-time converter.
+
+Useful knobs (env or flags): `--temp 0.7` token sampling temperature (0 = greedy, default 1.0 + nucleus 0.95), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:piu` in chat continues a truncated one), `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `TF=1` teacher-forcing validation.
+
+**The learning cache**: the engine records which experts your usage actually routes to (`.coli_usage` next to the model, updated every turn) and at startup automatically pins the hottest ones in spare RAM. colibrì literally gets faster the more you use it.
 
 ## Got a better machine? Try it — here's what to expect
 
