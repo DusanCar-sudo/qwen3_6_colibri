@@ -1332,6 +1332,8 @@ int main(int argc, char **argv){
     printf("caricato in %.2fs | densa residente: %.2f MB | layers=%d experts=%d | MTP %s (draft=%d)\n",
            now_s()-t0, m.resident_bytes/(1024.0*1024.0), m.c.n_layers, m.c.n_experts,
            m.has_mtp?"ATTIVA":"assente", g_draft);
+    /* anche su stderr: e' il canale che le UI (coli) mostrano all'utente */
+    fprintf(stderr,"[MTP] %s (draft=%d)\n", m.has_mtp?"attiva: decodifica speculativa nativa":"assente", g_draft);
     if(!strncmp(snap,"/mnt/",5))
         fprintf(stderr,"ATTENZIONE: il modello e' su %s (filesystem 9p/Windows, lento e fadvise inefficace).\n"
                        "            Per RAM e velocita' tienilo su ext4 (es. /home/...).\n", snap);

@@ -197,7 +197,8 @@ def cmd_chat(a):
     try:
         elog=open(errlog.name).read()
         mload=re.search(r"caricato in ([0-9.]+)s \| densa residente: ([0-9.]+) MB", elog)
-        extra=" · ".join(l.strip() for l in elog.splitlines() if l.startswith("[RAM_GB") or l.startswith("[PIN]"))
+        extra=" · ".join(l.strip() for l in elog.splitlines()
+                         if l.startswith(("[RAM_GB","[PIN]","[MTP]","[USAGE]")))
         if mload: print(f"  {C.grn}✓{C.r} pronto in {mload.group(1)}s {C.dim}· residente {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
         if extra:  print(f"  {C.dgray}{extra}{C.r}")
     except Exception: pass
