@@ -1264,7 +1264,7 @@ static double mem_available_gb(void){
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     Cfg *c=&m->c; int64_t eb=expert_bytes_probe(m,ebits);
     if(ram_gb<=0){ ram_gb=g_mem_avail_boot*0.88; if(ram_gb<4) ram_gb=8; }
-    double slack = 1.2e9 + 64.0*(double)eb
+    double slack = 1.2e9 + 2.5e9 + 64.0*(double)eb
         + (double)(c->n_layers+1)*max_ctx*(c->kv_lora+c->qk_rope)*4.0
         + (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
     return ram_gb*1e9 - (double)m->resident_bytes - slack;
@@ -1288,7 +1288,11 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     double ws_b  = 64.0*(double)eb;
     double kv_b  = (double)(c->n_layers+1)*max_ctx*(c->kv_lora+c->qk_rope)*4.0;
     double kvb_b = (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
-    double slack = 1.2e9 + ws_b + kv_b + kvb_b;
+    /* RISERVA PAGE-CACHE (misurato 2026-07-06): strangolarla fa crollare le pread
+     * buffered da ~800 a ~180 MB/s — gli ultimi GB di LRU rendono MENO di quanto
+     * costino in banda disco persa. 2.5 GB restano SEMPRE al kernel. */
+    double pc_b  = 2.5e9;
+    double slack = 1.2e9 + pc_b + ws_b + kv_b + kvb_b;
     double avail = ram_gb*1e9 - (double)m->resident_bytes - slack;
     int capmax = (avail>0 && nsp>0) ? (int)(avail/((double)nsp*eb)) : 0;
     if(capmax<1) capmax=1;
