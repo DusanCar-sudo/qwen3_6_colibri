@@ -32,3 +32,4 @@ stats*.txt
 /quant_test.py
 /profile_run.py
 /sweep.py
+c/models.json
