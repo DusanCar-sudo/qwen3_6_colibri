@@ -19,7 +19,7 @@ A 744B Mixture-of-Experts model activates only ~40B parameters per token — and
 - the **dense part** (attention, shared experts, embeddings — ~17B params) stays **resident in RAM at int4** (~9.9 GB);
 - the **21,504 routed experts** (75 MoE layers × 256 experts + the MTP head, ~19 MB each at int4) live **on disk** (~370 GB) and are **streamed on demand**, with a per-layer LRU cache, an optional pinned hot-store, and the OS page cache as a free L2.
 
-The engine is a single C file (`c/glm.c`, ~1,300 lines) plus small headers. No BLAS, no Python at runtime, no GPU.
+The engine is a single C file (`c/glm.c`, ~2,400 lines) plus small headers. No BLAS, no Python at runtime, no GPU required (an opt-in CUDA tier for pinned experts exists — see below).
 
 ## What's implemented
 
@@ -32,7 +32,9 @@ The engine is a single C file (`c/glm.c`, ~1,300 lines) plus small headers. No B
 - **MLA weight absorption** (DeepSeek trick) for decode: no per-token k/v reconstruction — the query absorbs `kv_b`, context is projected after attention. Validated exact: TF 32/32 and generation 20/20 with absorption forced everywhere.
 - **Async expert readahead**: while one block of experts is being multiplied, the kernel is already reading the next (`WILLNEED`).
 - **Quantization kernels**: int8 / packed int4 / packed int2, per-row scales, AVX2, dequant-on-use. Packing validated bit-identical to the int8 container.
-- **DSA sparse attention: in progress** — the lightning-indexer weights (a ~108 GB extraction from the FP8 repo, `--indexer` converter mode) are downloading; the indexer forward lands next. Until then attention is dense and exact for contexts ≤ 2048 tokens.
+- **DSA sparse attention** — GLM-5.2's lightning indexer, faithful to the reference `glm_moe_dsa` modeling: per-layer top-2048 causal key selection (full/shared indexer layers), auto-detected from the `out-idx-*` weights (`--indexer` converter mode, ~189 MB extracted from the FP8 repo). Validated exact: forcing the selection to keep every key reproduces dense attention token-for-token. `DSA=0` disables, `DSA_TOPK` overrides.
+- **KV-cache persistence** — conversations reopen **warm** across engine restarts: serve mode appends the compressed MLA KV to `.coli_kv` after every turn (~182 KB/token, crash-safe) and resumes it at startup with zero re-prefill. Validated byte-identical to an uninterrupted session. `KVSAVE=0` disables.
+- **Router-lookahead prefetch** (`PILOT=1`, experimental) — the next layer's routing is 71.6% predictable from the current layer's post-attention state (measured); a dedicated I/O thread prefetches those experts while the current layer computes.
 - **Batch-union MoE**: in prefill (and MTP verification), each unique expert of the batch is read once and applied to every position that routes to it.
 - **Byte-level BPE tokenizer in C** (GPT-2-style with Unicode-property regex, 320k merges).
 - **RAM safety**: the expert cache is auto-sized from `MemAvailable` at startup — an honest peak projection (working set, KV, MTP row, reconstruction buffers) so the kernel OOM-killer never fires.
@@ -155,6 +157,21 @@ The fixture has random weights and is not a language model. It exists only to
 preserve the real MLA/MoE/streaming shapes and compare CPU streaming, dense-only
 CUDA, CPU hot-store, and CUDA hot-expert execution with identical replay tokens.
 
+### Web interface
+
+`web/` contains a community-contributed browser UI (React + TypeScript, ~390
+lines of source, a pure API client — it never touches the engine directly):
+
+```bash
+cd web
+npm ci && npm run dev        # then point it at an OpenAI-compatible endpoint
+```
+
+It speaks the standard OpenAI Chat Completions protocol with SSE streaming, so it
+works against the colibrì OpenAI-compatible server (in review, #21) or any other
+compatible endpoint. Nothing leaves the endpoint you configure. The terminal
+`coli chat` remains the first-class interface.
+
 Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:piu` in chat continues a truncated one), `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `TF=1` teacher-forcing validation, `PILOT=1` router-lookahead disk prefetch (experimental — see below), `CAP_RAISE=0` don't auto-grow the expert cache.
 
 **The expert cache auto-sizes to your RAM** (since 2026-07-10): the engine now *raises* the LRU cap to fill your `--ram` budget instead of only lowering it. Before this fix a 128 GB machine ran with the same 8-experts/layer cache as a 16 GB one (issue #12) — **if you benchmarked colibrì before this date, rerun: your numbers were capped.**
@@ -253,6 +270,7 @@ c/
 ├── tools/                offline conversion, fixtures and benchmarks
 ├── scripts/              long-running conversion helpers
 └── tests/                dependency-free C and Python tests
+web/                      browser UI (pure OpenAI-API client, community-maintained)
 ```
 
 The runtime path intentionally stays flat and readable: `glm.c` plus its small
