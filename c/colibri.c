@@ -994,6 +994,57 @@ static void *map_of_fd(int fd){
     return base;
 }
 
+/* ==================== DUAL-SSD: two model copies, two drives ====================
+ * COLI_MODEL_MIRROR=<dir> registers a SECOND (read-only) copy of the model on
+ * another drive; expert reads are split between the two according to
+ * COLI_DISK_WEIGHTS=<primary>,<mirror> (relative bandwidth; without the env it
+ * is measured at startup with the engine's own access pattern). Cold decode is
+ * disk-bound (~11 GB/token): two NVMe drives reading in parallel add up. */
+static const char *g_mirror_dir=NULL;  /* COLI_MODEL_MIRROR / SNAP_MIRROR */
+static int g_mirror=0;                 /* 1 = mirror active (at least one shard accepted) */
+static int g_mir_share=64;             /* expert share routed to the mirror, out of 256 */
+static _Atomic int64_t g_mir_bytes[2]; /* bytes served per drive: [0] primary, [1] mirror */
+static _Atomic int64_t g_mir_nread[2];
+
+/* replica of one expert: DETERMINISTIC hash of (layer,eid). Determinism is a
+ * requirement, not a style choice: the readahead/PILOT WILLNEED and the demand
+ * pread must hit the same fd/page-cache, and in buffered mode an expert must
+ * never be cached twice (one copy per drive). */
+static inline int expert_route(int layer,int eid){
+    if(!g_mirror) return 0;
+    uint32_t h=(uint32_t)layer*2654435761u ^ (uint32_t)eid*0x9E3779B9u;
+    h^=h>>16; h*=0x45d9f3bu; h^=h>>16;
+    return (int)(h&255) < g_mir_share;
+}
+
+/* buffered fd of the replica, falling back to the primary if the file is not mirrored */
+static inline int rep_bfd(shards *S,int fd,int rep){
+    int r=st_fd_rep(S,fd,rep); return r<0?fd:r;
+}
+
+static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag);
+
+/* pread on the chosen replica with fallback to the primary on error/short-read:
+ * an unreadable sector (or an unmount) of the mirror must never kill the process
+ * when the primary can serve the same bytes. Delegates to pread_full so the
+ * mirror path inherits the short-read/EINTR loop and honest reporting (#236).
+ * Accounts bytes per drive. Returns 0 = ok, -1 = real error/EOF (like pread_full). */
+static ssize_t mir_pread(shards *S,int fd,int rep,void *buf,int64_t n,int64_t off,const char *tag){
+    int rfd = st_fd_rep(S,fd,rep);
+    int used = rep && rfd>=0;
+    if(rfd<0) rfd=fd;
+    int rc=pread_full(rfd,buf,n,off,tag);
+    if(rc && used){
+        static _Atomic int warned;
+        if(!atomic_exchange(&warned,1))
+            fprintf(stderr,"[MIRROR] read error on the mirror copy — falling back to the primary drive\n");
+        used=0; rc=pread_full(fd,buf,n,off,tag);
+    }
+    if(!rc){ atomic_fetch_add_explicit(&g_mir_bytes[used],n,memory_order_relaxed);
+             atomic_fetch_add_explicit(&g_mir_nread[used],1,memory_order_relaxed); }
+    return rc;
+}
+
 /* carica un expert nello slot. Container pre-quantizzato: le 3 matrici sono contigue nel
  * file -> UNA pread coalescente da ~19 MB dentro `slab` (+ le scale in fslab); i QT sono
  * viste dentro lo slab (zero copie). Fallback per modelli non quantizzati (oracolo tiny).
@@ -1061,10 +1112,12 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
         else                  { __atomic_add_fetch(&m->ld_main,1,__ATOMIC_RELAXED);
                                 __atomic_add_fetch(&m->bytes_main,(uint64_t)tb,__ATOMIC_RELAXED); }
     }
+    int rep=expert_route(layer,eid);             /* DUAL-SSD: this expert's replica */
+    if(rep && st_fd_rep(&m->S,tw[0]->fd,1)<0) rep=0;   /* shard not in the mirror (partial) */
     if(g_mmap){
         void *bw[3],*bq[3]; int okm=1;
         for(int k=0;k<3;k++){
-            bw[k]=map_of_fd(tw[k]->fd); bq[k]=map_of_fd(tq[k]->fd);
+            bw[k]=map_of_fd(rep_bfd(&m->S,tw[k]->fd,rep)); bq[k]=map_of_fd(rep_bfd(&m->S,tq[k]->fd,rep));
             if(!bw[k]||!bq[k]||((tw[k]->off)&3)||((tq[k]->off)&3)) okm=0;
         }
         if(okm){
@@ -1099,7 +1152,9 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
                  * the final resident set only, after GPU release has already nulled out the
                  * pointers for anything that isn't genuinely RAM-tier. */
                 atomic_fetch_add_explicit(&g_prof_io,(int64_t)(n+nq),memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mir_bytes[rep],tw[k]->nbytes+tq[k]->nbytes,memory_order_relaxed);
             }
+            atomic_fetch_add_explicit(&g_mir_nread[rep],1,memory_order_relaxed);
             s->eid=eid; return 0;
         }
     }
@@ -1163,7 +1218,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
     int64_t pos[3]; int done=0;
     if(contig){
         int64_t off0=tw[ord[0]]->off;
-        int dfd = g_direct ? st_direct_fd(&m->S, tw[ord[0]]->fd) : -1;
+        int dfd = g_direct ? st_direct_fd_rep(&m->S, tw[ord[0]]->fd, rep) : -1;
         if(dfd>=0){                              /* O_DIRECT: offset/len allineati a 4K */
             int64_t base=off0 & ~4095LL, need=(off0-base)+wtot;
             int64_t len=(need+4095)&~4095LL;
@@ -1171,28 +1226,31 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
             if(r>=need){
                 pos[ord[0]]=off0-base; pos[ord[1]]=pos[ord[0]]+tw[ord[0]]->nbytes;
                 pos[ord[2]]=pos[ord[1]]+tw[ord[1]]->nbytes; done=1;
+                atomic_fetch_add_explicit(&g_mir_bytes[rep],(int64_t)r,memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mir_nread[rep],1,memory_order_relaxed);
             }
         }
         if(!done){                               /* fallback bufferizzato */
-            if(pread_full(tw[ord[0]]->fd, s->slab, wtot, off0, "pread expert")){ if(fatal) exit(1); return -1; }
+            if(mir_pread(&m->S, tw[ord[0]]->fd, rep, s->slab, wtot, off0, "pread expert")){ if(fatal) exit(1); return -1; }
             pos[ord[0]]=0; pos[ord[1]]=tw[ord[0]]->nbytes; pos[ord[2]]=tw[ord[0]]->nbytes+tw[ord[1]]->nbytes; done=1;
         }
     }
     if(!done){                                   /* non contigui: 3 pread bufferizzate */
         int64_t o=0;
         for(int a=0;a<3;a++){ int k=ord[a];
-            if(pread_full(tw[k]->fd, s->slab+o, tw[k]->nbytes, tw[k]->off, "pread expert")){ if(fatal) exit(1); return -1; }
+            if(mir_pread(&m->S, tw[k]->fd, rep, s->slab+o, tw[k]->nbytes, tw[k]->off, "pread expert")){ if(fatal) exit(1); return -1; }
             pos[k]=o; o+=tw[k]->nbytes; }
     }
     float *fp[3]; int64_t fo=0;                  /* scale (piccole) */
     for(int k=0;k<3;k++){
-        if(pread_full(tq[k]->fd, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off, "pread qs")){ if(fatal) exit(1); return -1; }
+        if(mir_pread(&m->S, tq[k]->fd, rep, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off, "pread qs")){ if(fatal) exit(1); return -1; }
         fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4; }
     atomic_fetch_add_explicit(&g_prof_io,wtot+fo*4,memory_order_relaxed);
     if(g_drop){                                  /* scarta subito le pagine: evita che la page
-                                                  * cache in pressione strangoli il throughput */
-        posix_fadvise(tw[ord[0]]->fd, tw[ord[0]]->off, wtot, POSIX_FADV_DONTNEED);
-        for(int k=0;k<3;k++) posix_fadvise(tq[k]->fd, tq[k]->off, tq[k]->nbytes, POSIX_FADV_DONTNEED);
+                                                  * cache in pressione strangoli il throughput.
+                                                  * The drop targets the fd of the replica READ. */
+        posix_fadvise(rep_bfd(&m->S,tw[ord[0]]->fd,rep), tw[ord[0]]->off, wtot, POSIX_FADV_DONTNEED);
+        for(int k=0;k<3;k++) posix_fadvise(rep_bfd(&m->S,tq[k]->fd,rep), tq[k]->off, tq[k]->nbytes, POSIX_FADV_DONTNEED);
     }
     QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
     for(int k=0;k<3;k++){
@@ -1541,13 +1599,14 @@ static void expert_host_ensure(Model *m, int layer, ESlot *s){
 #endif
 
 /* prefetch asincrono dei pesi di un expert (e delle sue scale .qs): avvia il readahead
- * cosi' le letture sincrone successive trovano la page-cache calda. */
+ * cosi' le letture sincrone successive trovano la page-cache calda. The readahead
+ * targets the SAME replica that will serve the pread (expert_route is deterministic). */
 static void expert_prefetch(Model *m, int layer, int eid){
-    char nm[300];
+    char nm[300]; int rep=expert_route(layer,eid);
     const char *suf[3]={"gate_proj.weight","up_proj.weight","down_proj.weight"};
     for(int k=0;k<3;k++){
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s",layer,eid,suf[k]); st_prefetch(&m->S,nm);
-        char qs[320]; snprintf(qs,sizeof(qs),"%s.qs",nm); st_prefetch(&m->S,qs);
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s",layer,eid,suf[k]); st_prefetch_rep(&m->S,nm,rep);
+        char qs[320]; snprintf(qs,sizeof(qs),"%s.qs",nm); st_prefetch_rep(&m->S,qs,rep);
     }
 }
 
@@ -3794,6 +3853,14 @@ static void profile_print(Model *m, double elapsed){
         (unsigned long long)m->cpu_expert_rows,m->t_egpu,m->t_route,m->t_p2p,(unsigned long long)m->n_p2p,
         elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p>0?
         elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p:0);
+    if(g_mirror){
+        double b0=atomic_load_explicit(&g_mir_bytes[0],memory_order_relaxed)/1e9;
+        double b1=atomic_load_explicit(&g_mir_bytes[1],memory_order_relaxed)/1e9;
+        printf("MIRROR: primary %.2f GB (%lld reads) | mirror %.2f GB (%lld reads) — %.0f%% of expert bytes from the mirror\n",
+            b0,(long long)atomic_load_explicit(&g_mir_nread[0],memory_order_relaxed),
+            b1,(long long)atomic_load_explicit(&g_mir_nread[1],memory_order_relaxed),
+            b0+b1>0?100.0*b1/(b0+b1):0.0);
+    }
 #ifdef COLI_METAL
     if(g_metal_enabled){ uint64_t ok=0,fb=0,ex=0; double su=0,gp=0,sc=0;
         coli_metal_moe_counts(&ok,&fb,&ex); coli_metal_moe_times(&su,&gp,&sc);
@@ -3899,6 +3966,8 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     m->hits=m->miss=m->ereq=m->gpu_expert_calls=0; m->hit_pin=m->hit_ecache=0;
     profile_reset(m);
     ProfBase pb; prof_base(m,&pb);
+    atomic_store(&g_mir_bytes[0],0); atomic_store(&g_mir_bytes[1],0);
+    atomic_store(&g_mir_nread[0],0); atomic_store(&g_mir_nread[1],0);
     double t0=now_s(); int steps=0;
     for(int i=np-1;i<nfull-1;i++){
         double tf0=g_prof?now_s():0;
@@ -4732,6 +4801,71 @@ static void pin_wire(Model *m){
             "(no compression) in %.0fs\n", wired/1e9, now_s()-t0);
 }
 
+/* DUAL-SSD: measure one replica's read bandwidth with the engine's own access
+ * pattern (parallel ~19 MB reads, O_DIRECT twin when available — buffered would
+ * measure the page cache, see iobench's #86 caveat). Reads the largest shard at
+ * deterministic spread-out offsets; ~150 MB per drive, a few hundred ms total. */
+static double mirror_probe_bw(shards *S,int rep){
+    int big=-1; int64_t bsz=0;
+    for(int i=0;i<S->nfd;i++){
+        if(rep && S->mfds[i]<0) continue;
+        int64_t sz=lseek(rep?S->mfds[i]:S->fds[i],0,SEEK_END);
+        if(sz>bsz){ bsz=sz; big=i; }
+    }
+    const int64_t blk=19ll<<20; const int NB=8;
+    if(big<0 || bsz<blk*(NB+1)) return 0;
+    int dfd = rep? S->mdfds[big] : S->dfds[big];
+    int fd  = dfd>=0? dfd : (rep? S->mfds[big] : S->fds[big]);
+    if(dfd<0) fprintf(stderr,"[MIRROR] no O_DIRECT on %s: the probe may read the page cache — "
+                             "set COLI_DISK_WEIGHTS for an accurate split\n", rep?"the mirror":"the primary");
+    double t0=now_s(); int64_t tot=0;
+    #pragma omp parallel for schedule(dynamic,1) reduction(+:tot)
+    for(int i=0;i<NB;i++){
+        void *buf;
+        if(!posix_memalign(&buf,4096,blk)){
+            int64_t off=(((bsz-blk)/NB)*i) & ~4095ll;   /* deterministic, spread across the file */
+            ssize_t r=pread(fd,buf,blk,off);
+            if(r>0) tot+=r;
+            compat_aligned_free(buf);
+        }
+    }
+    double dt=now_s()-t0;
+    return (dt>0 && tot>0)? tot/1e9/dt : 0;
+}
+
+/* DUAL-SSD setup: register the mirror copy, derive the read split from
+ * COLI_DISK_WEIGHTS=<primary>,<mirror> or from a startup bandwidth probe.
+ * Runs after model_init (needs the shard index) and BEFORE any pin/autopin
+ * load, so the OMP-parallel pin warmup already streams from both drives. */
+static void mirror_setup(Model *m){
+    if(!g_mirror_dir) return;
+    const char *snap=getenv("SNAP");
+    if(snap && !strcmp(snap,g_mirror_dir)){
+        fprintf(stderr,"[MIRROR] mirror dir equals the model dir — ignored\n"); return;
+    }
+    int nf=st_mirror_init(&m->S,g_mirror_dir);
+    if(nf<=0){
+        fprintf(stderr,"[MIRROR] %s: no usable shard (missing or divergent copy) — "
+                       "running on the primary drive only\n",g_mirror_dir);
+        return;
+    }
+    g_mirror=1;
+    double wp=0,wm=0; const char *w=getenv("COLI_DISK_WEIGHTS"); const char *how="COLI_DISK_WEIGHTS";
+    if(w && (sscanf(w," %lf , %lf",&wp,&wm)!=2 || wp<=0 || wm<=0)){
+        fprintf(stderr,"[MIRROR] invalid COLI_DISK_WEIGHTS '%s' (want e.g. 9,3) — probing instead\n",w);
+        wp=wm=0;
+    }
+    if(wp<=0||wm<=0){
+        wp=mirror_probe_bw(&m->S,0); wm=mirror_probe_bw(&m->S,1); how="measured";
+        if(wp>0&&wm>0) fprintf(stderr,"[MIRROR] probe: primary %.2f GB/s, mirror %.2f GB/s\n",wp,wm);
+        else { wp=wm=1; how="fallback 1:1 (probe failed)"; }
+    }
+    int share=(int)(256.0*wm/(wp+wm)+0.5);
+    g_mir_share = share<1?1 : share>255?255 : share;
+    fprintf(stderr,"[MIRROR] %s: %d/%d shards | read split primary %.0f%% / mirror %.0f%% (%s)\n",
+        g_mirror_dir,nf,m->S.nfd,100.0*(256-g_mir_share)/256,100.0*g_mir_share/256,how);
+}
+
 typedef struct { int l,e; uint32_t c; } PinRec;
 static int pin_rec_cmp(const void *a,const void *b){
     const PinRec *x=a,*y=b; return x->c<y->c?1:x->c>y->c?-1:0;
@@ -5205,6 +5339,9 @@ int main(int argc, char **argv){
         fprintf(stderr,"URING=1 is supported only on Linux\n"); return 2;
 #endif
     }
+    g_mirror_dir = getenv("COLI_MODEL_MIRROR");            /* DUAL-SSD: second model copy */
+    if(!g_mirror_dir||!*g_mirror_dir) g_mirror_dir = getenv("SNAP_MIRROR");
+    if(g_mirror_dir&&!*g_mirror_dir) g_mirror_dir = NULL;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_spec_pin = getenv("SPEC_PIN")?atoi(getenv("SPEC_PIN")):1; /* #163: 0 = gate S-dipendenti storici / legacy S-dependent gates */
     if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
@@ -5327,6 +5464,9 @@ int main(int argc, char **argv){
                            "         Keep it on a native Linux fs (ext4/xfs/zfs) for memory efficiency and speed.\n", snap);
     }
 #endif
+    /* DUAL-SSD: register the mirror copy BEFORE any pin/autopin load, so the
+     * OMP-parallel pin warmup already streams from both drives. */
+    mirror_setup(&m);
     /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
      * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
     if(getenv("PIN")){
