@@ -512,12 +512,6 @@ static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward v
  * parte (#8). MAI un vincolo sul sampling: solo proposte, la verifica batch-union
  * decide — grammatica sbagliata = draft rifiutati, output identico.
  * GRAMMAR_DRAFT=n (default 24) limita i token forzati per forward. */
-static Grammar g_gram; static GrState g_gst;
-static Tok *g_gr_T=NULL;
-static int g_gr_on=0;     /* grammatica caricata e walker vivo */
-static int g_gr_armed=0;  /* lazy: parte dal primo byte ammesso dalla radice (salta i preamboli) */
-static int g_gr_max=24;
-static uint64_t g_gr_prop=0, g_gr_acc=0;
 static FILE *g_route_fp=NULL; /* ROUTE_TRACE=<path>: dump per-position top-K routing (ids:gates)
                                * per layer — offline co-activation / coupling analysis. Zero
                                * effect on computation; measurement only. */
@@ -537,6 +531,19 @@ static int g_couple=0, g_couple_k=8, g_couple_d=1;
 static int16_t *cp_pred=NULL;    /* [(L*2+(dL-1))*E + e]*CP_M + j -> target id (-1 none) */
 static float   *cp_cnt=NULL;
 static long g_cp_enq=0;
+/* All grammar-forced-draft state in one struct so it can become per-request
+ * in the multiplexed server. Fields (same semantics as the former globals):
+ * on = grammar loaded and walker alive; armed = lazy start from the first byte
+ * accepted at the root (skips preambles); max = forced-span cap per forward;
+ * prop/acc = proposed/accepted forced-draft counters. */
+typedef struct {
+    Grammar gram;
+    GrState st;
+    Tok *T;
+    int on, armed, max;
+    uint64_t prop, acc;
+} GrDraft;
+static GrDraft g_grd={.max=24};   /* process-level instance: PROMPT mode + run_serve keep using this */
 static void couple_prefetch(Model *m, int layer, const int *idx, int Ke);
 static int g_looka=0;    /* LOOKA=1: misura (solo contatori, zero effetti) quanto il routing MoE
                           * e' predicibile IN ANTICIPO — la domanda che decide se un prefetch
@@ -3955,7 +3962,7 @@ static void repin_pass(Model *m){ repin_pass_limit(m,16); }
  * grammar_draft propone lo span FORZATO successivo (un solo byte legale per posizione)
  * gia' tokenizzato. Il confine di tokenizzazione non e' garantito coincidere con quello
  * del modello: la verifica assorbe la differenza (al peggio l'ultimo draft e' rifiutato). */
-static void grammar_setup(Tok *T){
+static void grammar_setup(GrDraft *g, Tok *T){
     /* GRAMMAR=<file.gbnf> takes precedence; SCHEMA=<file.json> compiles a JSON-Schema
      * to GBNF (schema_gbnf.h) for the same draft source. Both fail soft: the engine
      * runs without a grammar and output is unchanged. */
@@ -3977,52 +3984,52 @@ static void grammar_setup(Tok *T){
         if(!gbnf){ fprintf(stderr,"[SCHEMA] %s: %s (running without grammar)\n",sf,serr); return; }
         txt=gbnf;
     }
-    if(gr_parse(&g_gram,txt)){ fprintf(stderr,"[GRAMMAR] %s: %s\n",path,g_gram.err); free(txt); return; }
+    if(gr_parse(&g->gram,txt)){ fprintf(stderr,"[GRAMMAR] %s: %s\n",path,g->gram.err); free(txt); return; }
     free(txt);
-    gr_state_init(&g_gst,&g_gram);
-    if(!g_gst.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion?)\n",path); return; }
-    if(getenv("GRAMMAR_DRAFT")) g_gr_max=atoi(getenv("GRAMMAR_DRAFT"));
-    if(g_gr_max<1) g_gr_max=1;
-    if(g_gr_max>48) g_gr_max=48;
-    g_gr_T=T; g_gr_on=1;
-    fprintf(stderr,"[GRAMMAR] %s: %d rules, forced span capped at %d tokens/forward\n",path,g_gram.n,g_gr_max);
+    gr_state_init(&g->st,&g->gram);
+    if(!g->st.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion?)\n",path); return; }
+    if(getenv("GRAMMAR_DRAFT")) g->max=atoi(getenv("GRAMMAR_DRAFT"));
+    if(g->max<1) g->max=1;
+    if(g->max>48) g->max=48;
+    g->T=T; g->on=1;
+    fprintf(stderr,"[GRAMMAR] %s: %d rules, forced span capped at %d tokens/forward\n",path,g->gram.n,g->max);
 }
 /* stato pulito all'inizio di ogni RISPOSTA (non tra i \x02MORE, che continuano) */
-static void grammar_reset(void){
-    if(!g_gr_on) return;
-    gr_state_init(&g_gst,&g_gram); g_gr_armed=0;
-    if(!g_gst.alive) g_gr_on=0;
+static void grammar_reset(GrDraft *g){
+    if(!g->on) return;
+    gr_state_init(&g->st,&g->gram); g->armed=0;
+    if(!g->st.alive) g->on=0;
 }
 /* consuma i byte di un token emesso. Preambolo (prima dell'arming): ignorato.
  * Desync dopo l'arming: si riarma in attesa del prossimo inizio valido — al peggio
  * i draft vengono rifiutati dalla verifica, l'output non cambia MAI. */
-static void gr_feed(int t){
-    if(!g_gr_on||!g_gr_T) return;
-    char b[64]; int n=tok_decode(g_gr_T,&t,1,b,63);
+static void gr_feed(GrDraft *g, int t){
+    if(!g->on||!g->T) return;
+    char b[64]; int n=tok_decode(g->T,&t,1,b,63);
     for(int i=0;i<n;i++){
-        int r=gr_accept(&g_gst,(unsigned char)b[i]);
-        if(r==1){ g_gr_armed=1; continue; }
-        if(r<0){ g_gr_on=0; return; }                 /* walker spento: fine dei draft */
-        if(!g_gr_armed) continue;                     /* preambolo: aspetta l'inizio */
-        gr_state_init(&g_gst,&g_gram); g_gr_armed=0;  /* desync: riparti dalla radice */
-        if(!g_gst.alive){ g_gr_on=0; return; }
-        if(gr_accept(&g_gst,(unsigned char)b[i])==1) g_gr_armed=1;
+        int r=gr_accept(&g->st,(unsigned char)b[i]);
+        if(r==1){ g->armed=1; continue; }
+        if(r<0){ g->on=0; return; }                   /* walker spento: fine dei draft */
+        if(!g->armed) continue;                       /* preambolo: aspetta l'inizio */
+        gr_state_init(&g->st,&g->gram); g->armed=0;   /* desync: riparti dalla radice */
+        if(!g->st.alive){ g->on=0; return; }
+        if(gr_accept(&g->st,(unsigned char)b[i])==1) g->armed=1;
     }
 }
 /* propone lo span forzato come token (max cap); 0 se la grammatica dirama qui */
-static int grammar_draft(int *draft, int cap){
-    if(!g_gr_on||!g_gr_armed||!g_gr_T||cap<1) return 0;
-    if(g_gr_prop>=32 && g_gr_acc*2<g_gr_prop){        /* guardia adattiva, come per MTP:
+static int grammar_draft(GrDraft *g, int *draft, int cap){
+    if(!g->on||!g->armed||!g->T||cap<1) return 0;
+    if(g->prop>=32 && g->acc*2<g->prop){              /* guardia adattiva, come per MTP:
         acceptance sotto il 50% = tokenizzazione fuori asse, meglio spegnersi */
-        g_gr_on=0;
+        g->on=0;
         fprintf(stderr,"[GRAMMAR] %.0f%% acceptance after %llu proposals: grammar drafts disabled\n",
-            100.0*g_gr_acc/g_gr_prop,(unsigned long long)g_gr_prop);
+            100.0*g->acc/g->prop,(unsigned long long)g->prop);
         return 0;
     }
-    char fb[512]; int nb=gr_forced(&g_gst,fb,(int)sizeof fb-1);
+    char fb[512]; int nb=gr_forced(&g->st,fb,(int)sizeof fb-1);
     if(nb<=0) return 0;
-    int g=tok_encode(g_gr_T,fb,nb,draft,cap);
-    return g>0?g:0;
+    int nt=tok_encode(g->T,fb,nb,draft,cap);          /* renamed local: 'g' is now the state param */
+    return nt>0?nt:0;
 }
 
 /* ---- SAMPLING (temperatura + nucleus) con verifica speculativa LOSSLESS ----
@@ -4080,12 +4087,12 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
-        gr_feed(next);                                  /* il walker segue l'output emesso */
+        gr_feed(&g_grd,next);                           /* il walker segue l'output emesso */
         if(emitted>=n_new) break;                       /* l'ultimo token non serve forwardarlo */
         int g = 0, gsrc = 0;                            /* sorgente: 1=grammatica 2=MTP/n-gram */
-        if(g_gr_on){                                    /* metodo F: prima la grammatica — dove
+        if(g_grd.on){                                   /* metodo F: prima la grammatica — dove
                                                          * forza, l'acceptance e' ~1 (#48) */
-            g=grammar_draft(draft,g_gr_max);
+            g=grammar_draft(&g_grd,draft,g_grd.max);
             if(g>0) gsrc=1;
         }
         if(!g && g_draft>0 && m->has_mtp){
@@ -4107,7 +4114,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if(g>n_new-emitted) g=n_new-emitted;
         if(kv+1+g+1>m->max_t) g=m->max_t-kv-2;
         if(g<0) g=0;
-        if(gsrc==1) g_gr_prop+=(uint64_t)g;
+        if(gsrc==1) g_grd.prop+=(uint64_t)g;
         int S=1+g; int batch[64]; batch[0]=next; memcpy(batch+1,draft,g*sizeof(int));
         double tf0=g_prof?now_s():0;
         float *lo=step_all(m,batch,S,kv); m->n_fw++;
@@ -4123,9 +4130,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
             if(!accept){ if(g_temp>0) carry_ban=draft[k]; break; }
             if((eos>=0 && draft[k]==eos) || is_stop(draft[k])){ done=1; break; }
             emit(draft[k],ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
-            gr_feed(draft[k]); k++;
+            gr_feed(&g_grd,draft[k]); k++;
         }
-        if(gsrc==1) g_gr_acc+=(uint64_t)k;
+        if(gsrc==1) g_grd.acc+=(uint64_t)k;
         else if(gsrc==2 && m->has_mtp) m->mtp_acc+=k;
         if(m->has_mtp && k>=1) mtp_absorb(m, all+kv+1, m->h_all, k, kv);   /* KV MTP in sync coi verificati */
         /* hlast deve corrispondere all'ultima posizione ACCETTATA (kv+k), non a fine batch */
@@ -4427,7 +4434,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm_tok(&m->c, eos, &T);
-    grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
+    grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
     int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
@@ -4456,7 +4463,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     ProfBase pb; prof_base(m,&pb);
     double t=now_s();
     EmitStream es={&T,m,t,0,0};
-    grammar_reset();
+    grammar_reset(&g_grd);
     int produced=spec_decode(m,all,np,ngen,eos,logit,emit_stream,&es,NULL);
     double dt=now_s()-t;
     double tot=m->hits+m->miss;
@@ -4483,8 +4490,8 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
         m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0, (unsigned long long)m->mtp_acc, (unsigned long long)m->mtp_prop);
     if(g_cp_enq) printf("couple: %ld cross-layer prefetch hints enqueued\n", g_cp_enq);
-    if(g_gr_prop) printf("grammar: %.0f%% acceptance (%llu/%llu forced drafts)\n",
-        100.0*g_gr_acc/g_gr_prop, (unsigned long long)g_gr_acc, (unsigned long long)g_gr_prop);
+    if(g_grd.prop) printf("grammar: %.0f%% acceptance (%llu/%llu forced drafts)\n",
+        100.0*g_grd.acc/g_grd.prop, (unsigned long long)g_grd.acc, (unsigned long long)g_grd.prop);
     if(g_disk_split) printf("disk-load split: draft %llu + absorb %llu + verify/main %llu misses | "
            "MTP-layer %llu loads %.2f GB | main-layers %llu loads %.2f GB (MTP %.1f%% of bytes)\n",
         (unsigned long long)m->miss_draft, (unsigned long long)m->miss_absorb,
@@ -4977,7 +4984,7 @@ static void run_serve(Model *m, const char *snap){
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm_tok(&m->c, eos, &T);
-    grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
+    grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
     int ngen=getenv("NGEN")?atoi(getenv("NGEN")):256;
@@ -5096,7 +5103,7 @@ static void run_serve(Model *m, const char *snap){
         else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
         EmitStream es={&T,m,now_s(),0,1};
         int prod=0;
-        grammar_reset();                         /* nuova risposta = nuovo documento (MORE invece continua) */
+        grammar_reset(&g_grd);                         /* nuova risposta = nuovo documento (MORE invece continua) */
         if(cur>0) prod=spec_decode(m,hist,len,cur,eos,logit,emit_stream,&es,&len);
         else free(logit);
         double tdt=now_s()-tt0; if(tdt<1e-6) tdt=1e-6;
