@@ -96,6 +96,17 @@ static const int g_asymmetric_caps[16] = {
 
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
 static void pilot_prefetch_next_token(Model *m, int lnext);
+static void *pilot_worker(void *arg);
+static void ensure_pilot_worker_started(Model *m);
+static void slot_ensure_allocated(Model *m, Slot *s);
+
+static void ensure_pilot_worker_started(Model *m) {
+    if (!pilot_m) {
+        pilot_m = m;
+        pthread_t t;
+        pthread_create(&t, NULL, pilot_worker, NULL);
+    }
+}
 
 /* ---------- utility ---------- */
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
@@ -283,6 +294,45 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     if (cl < 0.1f) cl = 0.1f; if (cl > 1.0f) cl = 1.0f;
     m->pilot_conf_limit = cl;
     m->dense_load_s = now_s() - t0;
+
+    // Persistent Hot Pinning: try to load hot_pinned.bin
+    char pinpath[512];
+    snprintf(pinpath, sizeof(pinpath), "%s/hot_pinned.bin", snap);
+    FILE *pinf = fopen(pinpath, "rb");
+    if (pinf) {
+        size_t expected_size = (size_t)c->n_layers * c->n_experts;
+        if (fread(m->is_pinned, 1, expected_size, pinf) == expected_size) {
+            m->hot_pinned = 1;
+            printf("[HOT] Loaded persistent pinning from %s\n", pinpath);
+            
+            if (g_pilot) {
+                ensure_pilot_worker_started(m);
+                for (int l = 0; l < c->n_layers; l++) {
+                    for (int e = 0; e < c->n_experts; e++) {
+                        if (m->is_pinned[l * c->n_experts + e]) {
+                            unsigned w = __atomic_load_n(&pilot_w, __ATOMIC_RELAXED);
+                            unsigned r = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
+                            if (w - r < 4096) {
+                                pilot_q[w & 4095].l = l; pilot_q[w & 4095].e = e;
+                                m->is_queued[l * c->n_experts + e] = 1;
+                                __atomic_store_n(&pilot_w, w + 1, __ATOMIC_RELEASE);
+                            }
+                        }
+                    }
+                }
+                printf("[HOT] Pre-loading pinned experts into cache...\n");
+                double t_wait = now_s();
+                while (1) {
+                    unsigned r = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
+                    unsigned w = __atomic_load_n(&pilot_w, __ATOMIC_ACQUIRE);
+                    if (r == w) break;
+                    sleep_ms(2);
+                }
+                printf("[HOT] Pre-loaded in %.1fs!\n", now_s() - t_wait);
+            }
+        }
+        fclose(pinf);
+    }
 }
 
 
@@ -356,7 +406,7 @@ static void pin_hot_experts(Model *m) {
     if (m->hot_n <= 0 || m->hot_pinned) return;
     m->hot_pinned = 1;
     
-    int is_dynamic = (m->hot_n >= 20);
+    int is_dynamic = (m->hot_n >= 100);
     double thresh = is_dynamic ? (double)m->hot_n / 1000.0 : 0.0;
     
     int pinned_total = 0;
@@ -559,7 +609,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
-    if (g_pilot) {
+    if (g_pilot && m->token_count > 0) {
         unsigned r = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
         __atomic_store_n(&pilot_w, r, __ATOMIC_RELEASE);
         memset(m->is_queued, 0, (size_t)c->n_layers * c->n_experts);
@@ -669,11 +719,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
     /* IMPROVEMENT 4: wide prefetch — top K * g_wide candidates */
     int cand = c->topk * g_wide;
     if (cand > E) cand = E;
-    if (!pilot_m) {
-        pilot_m = m;
-        pthread_t t;
-        pthread_create(&t, NULL, pilot_worker, NULL);
-    }
+    ensure_pilot_worker_started(m);
     float *logits = falloc((int64_t)S * E);
     Layer *l = &m->L[lnext];
 
@@ -923,6 +969,24 @@ int main(int argc, char **argv) {
     printf("Expert cache hit rate: %.1f%%  (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
 
+
+    // Persistent Hot Pinning: save dynamic pinning if newly created
+    if (m.hot_pinned) {
+        char pinpath[512];
+        snprintf(pinpath, sizeof(pinpath), "%s/hot_pinned.bin", snap);
+        FILE *pinf_chk = fopen(pinpath, "rb");
+        if (!pinf_chk) {
+            FILE *pinf_save = fopen(pinpath, "wb");
+            if (pinf_save) {
+                size_t expected_size = (size_t)m.c.n_layers * m.c.n_experts;
+                fwrite(m.is_pinned, 1, expected_size, pinf_save);
+                fclose(pinf_save);
+                printf("[HOT] Saved persistent pinning to %s\n", pinpath);
+            }
+        } else {
+            fclose(pinf_chk);
+        }
+    }
 
     printf("Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
     free(buf); free(arena);
