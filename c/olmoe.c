@@ -79,6 +79,8 @@ typedef struct {
     float *momentum_logits; /* [n_layers * n_experts], EMA of gate logits */
     float pilot_smooth;     /* SMOOTH env: EMA coefficient 0.0-0.9 (default 0.3) */
     uint8_t *is_pinned;     /* [n_layers * n_experts], 1 if expert is globally pinned */
+    uint8_t *is_queued;     /* [n_layers * n_experts], 1 if expert is currently in the prefetch queue */
+    float pilot_conf_limit; /* CONF_LIMIT env: cumulative gate probability threshold (e.g. 0.92) */
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -268,6 +270,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     if (sv < 0.f) sv = 0.f; if (sv > 0.95f) sv = 0.95f;
     m->pilot_smooth = sv;
     m->is_pinned = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint8_t));
+    m->is_queued = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint8_t));
+    float cl = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
+    if (cl < 0.1f) cl = 0.1f; if (cl > 1.0f) cl = 1.0f;
+    m->pilot_conf_limit = cl;
     m->dense_load_s = now_s() - t0;
 }
 
@@ -510,9 +516,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     free(logits); free(g); free(u); free(hh);
 }
 
-/* un passo: token nuovi ids[S] a posizione pos_base. Ritorna logits dell'ultimo token (malloc'd). */
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
+    if (g_pilot) {
+        unsigned r = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
+        __atomic_store_n(&pilot_w, r, __ATOMIC_RELEASE);
+        memset(m->is_queued, 0, (size_t)c->n_layers * c->n_experts);
+    }
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
@@ -555,7 +565,11 @@ static void pilot_realload(Model *m, int layer, int eid) {
 
     pthread_mutex_lock(&g_pilot_mx);
     for (int i = 0; i < lc->n; i++) {
-        if (lc->slots[i].eid == eid) { pthread_mutex_unlock(&g_pilot_mx); return; }
+        if (lc->slots[i].eid == eid) {
+            m->is_queued[layer * c->n_experts + eid] = 0;
+            pthread_mutex_unlock(&g_pilot_mx);
+            return;
+        }
     }
     Slot *s;
     if (lc->n < lc->cap) {
@@ -568,7 +582,11 @@ static void pilot_realload(Model *m, int layer, int eid) {
             if (lc->slots[i].pinned) continue;
             if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
         }
-        if (lru < 0) { pthread_mutex_unlock(&g_pilot_mx); return; } /* all pinned, skip */
+        if (lru < 0) {
+            m->is_queued[layer * c->n_experts + eid] = 0;
+            pthread_mutex_unlock(&g_pilot_mx);
+            return; /* all pinned, skip */
+        }
         s = &lc->slots[lru]; s->pinned = 0;
     }
     s->eid = -1; s->used = ++m->clock;
@@ -580,6 +598,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
     s->eid = eid;
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
+    m->is_queued[layer * c->n_experts + eid] = 0;
     pthread_mutex_unlock(&g_pilot_mx);
 }
 
@@ -647,15 +666,36 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
             }
         }
 
-        int idx[128]; /* up to topk * 4 */
-        for (int kk = 0; kk < cand; kk++) {
-            int best = -1; float bv = -1e30f;
+        int cand = 0;
+        int idx[128];
+
+        float *exps = falloc(E);
+        float sum_exps = 0.f;
+        for (int e = 0; e < E; e++) {
+            exps[e] = expf(blended[e]);
+            sum_exps += exps[e];
+        }
+
+        float cum_sum = 0.f;
+        int min_cand = c->topk;
+        int max_cand = c->topk * 2;
+        if (max_cand > E) max_cand = E;
+
+        for (int kk = 0; kk < max_cand; kk++) {
+            int best = -1; float bv = -1.f;
             for (int e = 0; e < E; e++) {
                 int taken = 0; for (int j = 0; j < kk; j++) if (idx[j] == e) { taken=1; break; }
-                if (!taken && blended[e] > bv) { bv = blended[e]; best = e; }
+                if (!taken && exps[e] > bv) { bv = exps[e]; best = e; }
             }
+            if (best < 0) break;
             idx[kk] = best;
+            cum_sum += bv;
+            cand++;
+            if (cum_sum >= m->pilot_conf_limit * sum_exps && cand >= min_cand) {
+                break;
+            }
         }
+        free(exps);
 
         if (blended != pr) free(blended);
 
@@ -663,6 +703,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
         for (int a = 0; a < cand-1; a++)
             for (int b = a+1; b < cand; b++)
                 if (idx[b] >= 0 && (idx[a] < 0 || idx[a] > idx[b])) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
+
         for (int kk = 0; kk < cand; kk++) {
             int eid = idx[kk];
             if (eid < 0) continue;
@@ -674,12 +715,26 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
             }
             pthread_mutex_unlock(&g_pilot_mx);
             if (!found) {
-                unsigned w2 = __atomic_load_n(&pilot_w, __ATOMIC_RELAXED);
-                unsigned r2 = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
-                if (w2 - r2 < 4096) {
-                    pilot_q[w2 & 4095].l = lnext;
-                    pilot_q[w2 & 4095].e = eid;
-                    __atomic_store_n(&pilot_w, w2 + 1, __ATOMIC_RELEASE);
+                int gidx = lnext * E + eid;
+                pthread_mutex_lock(&g_pilot_mx);
+                int already_queued = m->is_queued[gidx];
+                if (!already_queued) {
+                    m->is_queued[gidx] = 1;
+                }
+                pthread_mutex_unlock(&g_pilot_mx);
+
+                if (!already_queued) {
+                    unsigned w2 = __atomic_load_n(&pilot_w, __ATOMIC_RELAXED);
+                    unsigned r2 = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
+                    if (w2 - r2 < 4096) {
+                        pilot_q[w2 & 4095].l = lnext;
+                        pilot_q[w2 & 4095].e = eid;
+                        __atomic_store_n(&pilot_w, w2 + 1, __ATOMIC_RELEASE);
+                    } else {
+                        pthread_mutex_lock(&g_pilot_mx);
+                        m->is_queued[gidx] = 0;
+                        pthread_mutex_unlock(&g_pilot_mx);
+                    }
                 }
             }
         }
@@ -735,8 +790,11 @@ int main(int argc, char **argv) {
     }
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
 
-    printf("== Streaming C engine v2 | cache=%d/layer bits=%d pilot=%d wide=%d hot=%d rebal=%d ==\n",
-           cap, bits, g_pilot, g_wide, hot_n, rebal);
+    float smooth = getenv("SMOOTH") ? (float)atof(getenv("SMOOTH")) : 0.3f;
+    float conf   = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
+
+    printf("== Streaming C engine v2.2 | cache=%d/layer bits=%d pilot=%d wide=%d hot=%d rebal=%d smooth=%.2f conf=%.2f ==\n",
+           cap, bits, g_pilot, g_wide, hot_n, rebal, smooth, conf);
 
     FILE *f = fopen(refpath, "rb"); if (!f) { perror(refpath); return 1; }
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
