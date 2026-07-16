@@ -179,6 +179,11 @@ GCC 16.1.0 (x86_64-ucrt-posix-seh).
 scoop install mingw-winlibs                    # portable, no shell needed
 # or: pacman -S mingw-w64-x86_64-gcc make     # via MSYS2
 
+# Python (needed by the `coli` CLI and API server). A fresh Windows resolves
+# `python` to a Microsoft Store alias stub that opens the Store instead of
+# running anything (#198) — installing the real interpreter replaces the stub:
+winget install -e --id Python.Python.3.12
+
 # Build (from c/ directory):
 make glm.exe            # GLM-5.2 engine (static, no DLL dependencies)
 make olmoe.exe          # OLMoE engine (same shims)
