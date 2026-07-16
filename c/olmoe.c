@@ -89,13 +89,8 @@ static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
 static int g_pilot = 0;
 static int g_wide  = 1;  /* IMPROVEMENT 4: top-K * g_wide candidates prefetched */
-static volatile int g_curr_layer = 0; /* current layer processed by the main thread */
-static const int g_asymmetric_caps[16] = {
-    34, 36, 34, 34, 28, 30, 26, 28, 34, 34, 34, 34, 34, 36, 30, 30
-};
 
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
-static void pilot_prefetch_next_token(Model *m, int lnext);
 static void *pilot_worker(void *arg);
 static void ensure_pilot_worker_started(Model *m);
 static void slot_ensure_allocated(Model *m, Slot *s);
@@ -832,64 +827,6 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
     free(logits);
 }
 
-static void pilot_prefetch_next_token(Model *m, int lnext) {
-    if (lnext < 0 || lnext >= m->c.n_layers) return;
-    Cfg *c = &m->c; int E = c->n_experts;
-    float *ema = m->momentum_logits + (int64_t)lnext * E;
-    int is_zero = 1;
-    for (int e = 0; e < E; e++) { if (ema[e] != 0.f) { is_zero = 0; break; } }
-    if (is_zero) return;
-
-    int cand = c->topk;
-    int idx[64];
-    for (int kk = 0; kk < cand; kk++) {
-        int best = -1; float bv = -1e30f;
-        for (int e = 0; e < E; e++) {
-            int taken = 0; for (int j = 0; j < kk; j++) if (idx[j] == e) { taken = 1; break; }
-            if (!taken && ema[e] > bv) { bv = ema[e]; best = e; }
-        }
-        idx[kk] = best;
-    }
-
-    for (int a = 0; a < cand - 1; a++)
-        for (int b = a + 1; b < cand; b++)
-            if (idx[b] >= 0 && (idx[a] < 0 || idx[a] > idx[b])) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
-
-    for (int kk = 0; kk < cand; kk++) {
-        int eid = idx[kk];
-        if (eid < 0) continue;
-        int found = 0;
-        pthread_mutex_lock(&g_pilot_mx);
-        LCache *lc = &m->cache[lnext];
-        for (int z = 0; z < lc->n; z++) {
-            if (lc->slots[z].eid == eid) { found = 1; break; }
-        }
-        pthread_mutex_unlock(&g_pilot_mx);
-        if (!found) {
-            int gidx = lnext * E + eid;
-            pthread_mutex_lock(&g_pilot_mx);
-            int already_queued = m->is_queued[gidx];
-            if (!already_queued) {
-                m->is_queued[gidx] = 1;
-            }
-            pthread_mutex_unlock(&g_pilot_mx);
-
-            if (!already_queued) {
-                unsigned w2 = __atomic_load_n(&pilot_w, __ATOMIC_RELAXED);
-                unsigned r2 = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
-                if (w2 - r2 < 4096) {
-                    pilot_q[w2 & 4095].l = lnext;
-                    pilot_q[w2 & 4095].e = eid;
-                    __atomic_store_n(&pilot_w, w2 + 1, __ATOMIC_RELEASE);
-                } else {
-                    pthread_mutex_lock(&g_pilot_mx);
-                    m->is_queued[gidx] = 0;
-                    pthread_mutex_unlock(&g_pilot_mx);
-                }
-            }
-        }
-    }
-}
 
 /* generazione greedy. prompt[np] -> riempie out[np+n_new] */
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {

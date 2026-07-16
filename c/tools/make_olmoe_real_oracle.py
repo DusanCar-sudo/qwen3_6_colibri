@@ -22,29 +22,25 @@ try:
 except ImportError as exc:
     sys.exit(f"Missing deps: {exc}. Run: pip install torch transformers")
 
-MODEL_DIR = (
-    Path(r"C:\Users\egonr\.cache\huggingface\hub"
-         r"\models--allenai--OLMoE-1B-7B-0125-Instruct"
-         r"\snapshots\b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e")
-)
+MODEL_ID = "allenai/OLMoE-1B-7B-0125-Instruct"
 
 OUT_JSON = Path(__file__).resolve().parent.parent / "ref_olmoe_real.json"
 
 PROMPT = "The capital of France is"
 MAX_NEW_TOKENS = 12
 
-print(f"Loading tokenizer from {MODEL_DIR} ...")
-tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR))
+print(f"Loading tokenizer from {MODEL_ID} ...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
 print("Encoding prompt ...")
 enc = tokenizer(PROMPT, return_tensors="pt")
 prompt_ids = enc["input_ids"][0].tolist()
 print(f"  Prompt IDs ({len(prompt_ids)}): {prompt_ids}")
 
-print(f"Loading OLMoE model from {MODEL_DIR} ...")
+print(f"Loading OLMoE model from {MODEL_ID} ...")
 print("  (this will use ~14 GB RAM — please be patient)")
 model = OlmoeForCausalLM.from_pretrained(
-    str(MODEL_DIR),
+    MODEL_ID,
     torch_dtype=torch.bfloat16,
     device_map="cpu",
     low_cpu_mem_usage=True,

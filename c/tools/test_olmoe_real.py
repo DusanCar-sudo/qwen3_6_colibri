@@ -22,8 +22,9 @@ if sys.platform == "win32":
             pass
 
 HERE = Path(__file__).resolve().parent.parent
-ENGINE = HERE / "olmoe.exe"
-SNAP = HERE / "olmoe_i4"
+ext = ".exe" if sys.platform == "win32" else ""
+ENGINE = HERE / f"olmoe{ext}"
+SNAP = os.getenv("SNAP", str(HERE.parent / "olmoe_merged"))
 REF_OUT = HERE / "ref_olmoe_real.json"
 BOOTSTRAP_REF = HERE / "ref_olmoe_bootstrap.json"
 
