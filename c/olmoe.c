@@ -54,8 +54,7 @@ typedef struct {
  * meccanismo che fa stare GLM-5.2 nei 15 GB. dequant-on-use nel matmul. */
 /* IMPROVEMENT 2: pinned=1 means this slot is never evicted (hot expert). */
 typedef struct { int eid; int pinned; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; } Slot;
-/* IMPROVEMENT 3: per-layer hit/miss stats for adaptive rebalancing. */
-typedef struct { Slot *slots; int n, cap; uint64_t layer_hits, layer_miss; } LCache;
+typedef struct { Slot *slots; int n, cap; } LCache;
 
 typedef struct {
     Cfg c;
@@ -70,8 +69,7 @@ typedef struct {
     /* IMPROVEMENT 2: expert frequency heatmap */
     uint32_t *freq;
     int freq_token_count, hot_pinned, hot_n, warmup_tokens;
-    /* IMPROVEMENT 3: adaptive rebalance */
-    int token_count, rebal_interval, total_cap;
+    int token_count;
     /* PREDICTION IMPROVEMENT A: per-layer smoothed gate logits across tokens.
      * momentum_logits[l*E .. (l+1)*E-1] = EMA of recent gate outputs.
      * Blended with fresh gate prediction: final = (1-smooth)*fresh + smooth*ema.
@@ -99,7 +97,11 @@ static void ensure_pilot_worker_started(Model *m) {
     if (!pilot_m) {
         pilot_m = m;
         pthread_t t;
-        pthread_create(&t, NULL, pilot_worker, NULL);
+        if (pthread_create(&t, NULL, pilot_worker, NULL) != 0) {
+            fprintf(stderr, "Error: Failed to create pilot prefetch worker thread\n");
+            exit(1);
+        }
+        pthread_detach(t);
     }
 }
 
@@ -263,7 +265,6 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         LD(gate, "mlp.gate.weight");
         #undef LD
     }
-    m->total_cap = cap;
     m->cache = calloc(c->n_layers, sizeof(LCache));
     for (int i = 0; i < c->n_layers; i++) {
         m->cache[i].cap = cap;
@@ -274,8 +275,6 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     m->hot_pinned = 0; m->freq_token_count = 0;
     m->hot_n         = getenv("HOT")    ? atoi(getenv("HOT"))    : 0;
     m->warmup_tokens = getenv("WARMUP") ? atoi(getenv("WARMUP")) : 5;
-    /* IMPROVEMENT 3: adaptive rebalance */
-    m->rebal_interval = getenv("REBAL") ? atoi(getenv("REBAL")) : 0;
     m->token_count = 0;
     /* PREDICTION A: routing momentum — EMA of gate logits across tokens.
      * Initialized to zero; first token sets EMA = fresh logits. */
@@ -309,7 +308,9 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
                             unsigned r = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
                             if (w - r < 4096) {
                                 pilot_q[w & 4095].l = l; pilot_q[w & 4095].e = e;
+                                pthread_mutex_lock(&g_pilot_mx);
                                 m->is_queued[l * c->n_experts + e] = 1;
+                                pthread_mutex_unlock(&g_pilot_mx);
                                 __atomic_store_n(&pilot_w, w + 1, __ATOMIC_RELEASE);
                             }
                         }
@@ -330,13 +331,16 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     }
 }
 
-
 static void slot_ensure_allocated(Model *m, Slot *s) {
     if (s->g) return;
     Cfg *c = &m->c;
     int64_t ng = (int64_t)c->inter * c->hidden;
     int64_t nd = (int64_t)c->hidden * c->inter;
     int8_t *w_block = malloc(ng + ng + nd);
+    if (!w_block) {
+        fprintf(stderr, "Error: Out of memory allocating slot weights block\n");
+        exit(1);
+    }
     s->g = w_block;
     s->u = w_block + ng;
     s->d = w_block + ng + ng;
@@ -360,11 +364,11 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     LCache *lc = &m->cache[layer];
     pthread_mutex_lock(&g_pilot_mx);
     for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
-        m->hits++; lc->layer_hits++; lc->slots[i].used = ++m->clock; *out = &lc->slots[i];
+        m->hits++; lc->slots[i].used = ++m->clock; *out = &lc->slots[i];
         pthread_mutex_unlock(&g_pilot_mx);
         return;
     }
-    m->miss++; lc->layer_miss++;
+    m->miss++;
     Cfg *c = &m->c;
     Slot *s;
     if (lc->n < lc->cap) {
@@ -416,6 +420,7 @@ static void pin_hot_experts(Model *m) {
         if (max_pin < 4) max_pin = 4;
         
         int hn = is_dynamic ? max_pin : (m->hot_n < c->n_experts ? m->hot_n : c->n_experts);
+        if (hn > 256) hn = 256;
         int hot_eids[256];
         int actual_hn = 0;
         
@@ -463,29 +468,6 @@ static void pin_hot_experts(Model *m) {
     }
 }
 
-/* ---------- IMPROVEMENT 3: adaptive per-layer cache rebalancing ---------- */
-static void rebalance_cache(Model *m) {
-    Cfg *c = &m->c;
-    uint64_t total_miss = 0;
-    for (int l = 0; l < c->n_layers; l++) total_miss += m->cache[l].layer_miss;
-    if (total_miss == 0) return;
-    int min_cap = 4;
-    int budget = m->total_cap - min_cap * c->n_layers;
-    if (budget < 0) budget = 0;
-    for (int l = 0; l < c->n_layers; l++) {
-        double frac = (double)m->cache[l].layer_miss / (double)total_miss;
-        int new_cap = min_cap + (int)(frac * budget + 0.5);
-        LCache *lc = &m->cache[l];
-        if (new_cap > lc->cap) {
-            Slot *ns = realloc(lc->slots, new_cap * sizeof(Slot));
-            if (ns) {
-                memset(ns + lc->cap, 0, (new_cap - lc->cap) * sizeof(Slot));
-                lc->slots = ns; lc->cap = new_cap;
-            }
-        }
-        lc->layer_hits = 0; lc->layer_miss = 0;
-    }
-}
 
 /* ---------- RoPE su un vettore di una testa (head_dim) a posizione assoluta pos ---------- */
 static void rope_head(float *x, int pos, const Cfg *c) {
@@ -607,7 +589,9 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     if (g_pilot && m->token_count > 0) {
         unsigned r = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
         __atomic_store_n(&pilot_w, r, __ATOMIC_RELEASE);
+        pthread_mutex_lock(&g_pilot_mx);
         memset(m->is_queued, 0, (size_t)c->n_layers * c->n_experts);
+        pthread_mutex_unlock(&g_pilot_mx);
     }
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
@@ -636,9 +620,6 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     m->token_count++; m->freq_token_count++;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens)
         pin_hot_experts(m);
-    /* IMPROVEMENT 3: periodic adaptive rebalance */
-    if (m->rebal_interval > 0 && m->token_count % m->rebal_interval == 0)
-        rebalance_cache(m);
     m->kv_len = pos_base + S;
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
@@ -711,9 +692,6 @@ static void *pilot_worker(void *arg) {
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
     if (lnext < 0 || lnext >= m->c.n_layers) return;
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts;
-    /* IMPROVEMENT 4: wide prefetch — top K * g_wide candidates */
-    int cand = c->topk * g_wide;
-    if (cand > E) cand = E;
     ensure_pilot_worker_started(m);
     float *logits = falloc((int64_t)S * E);
     Layer *l = &m->L[lnext];
@@ -754,16 +732,19 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
         int cand = 0;
         int idx[128];
 
+        float max_logit = -1e30f;
+        for (int e = 0; e < E; e++) { if (blended[e] > max_logit) max_logit = blended[e]; }
         float *exps = falloc(E);
         float sum_exps = 0.f;
         for (int e = 0; e < E; e++) {
-            exps[e] = expf(blended[e]);
+            exps[e] = expf(blended[e] - max_logit);
             sum_exps += exps[e];
         }
 
         float cum_sum = 0.f;
         int min_cand = c->topk;
-        int max_cand = c->topk * 2;
+        int max_cand = c->topk * g_wide;
+        if (max_cand < min_cand) max_cand = min_cand;
         if (max_cand > E) max_cand = E;
 
         for (int kk = 0; kk < max_cand; kk++) {
@@ -867,7 +848,6 @@ int main(int argc, char **argv) {
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;
     int hot_n  = getenv("HOT")   ? atoi(getenv("HOT"))   : 0;
-    int rebal  = getenv("REBAL") ? atoi(getenv("REBAL")) : 0;
     int cap    = argc > 1 ? atoi(argv[1]) : 16;
     int bits   = argc > 2 ? atoi(argv[2]) : 8;
     if (bits < 2 || bits > 8) {
@@ -879,8 +859,8 @@ int main(int argc, char **argv) {
     float smooth = getenv("SMOOTH") ? (float)atof(getenv("SMOOTH")) : 0.3f;
     float conf   = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
 
-    printf("== Streaming C engine v2.2 | cache=%d/layer bits=%d pilot=%d wide=%d hot=%d rebal=%d smooth=%.2f conf=%.2f ==\n",
-           cap, bits, g_pilot, g_wide, hot_n, rebal, smooth, conf);
+    printf("== Streaming C engine v2.2 | cache=%d/layer bits=%d pilot=%d wide=%d hot=%d smooth=%.2f conf=%.2f ==\n",
+           cap, bits, g_pilot, g_wide, hot_n, smooth, conf);
 
     FILE *f = fopen(refpath, "rb"); if (!f) { perror(refpath); return 1; }
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);

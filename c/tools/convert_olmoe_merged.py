@@ -20,8 +20,9 @@ if sys.platform == "win32":
 try:
     import torch
     from safetensors.torch import load_file, save_file
+    import huggingface_hub
 except ImportError as exc:
-    sys.exit(f"Missing dependencies: {exc}. Install: pip install torch safetensors")
+    sys.exit(f"Missing dependencies: {exc}. Install: pip install torch safetensors huggingface_hub")
 
 EXPERT_KEY_RE = r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
 
