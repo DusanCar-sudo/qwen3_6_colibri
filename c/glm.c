@@ -1332,12 +1332,25 @@ static void rope_interleave(float *v, int pos, const Cfg *c){
 }
 
 /* ---------- config ---------- */
+/* SEC-9: bounded slurp for untrusted config/oracle JSON. config.json arrives from
+ * unverified mirrors (see qt_check_fmt threat model); an unbounded ftell->malloc
+ * gave a hostile file a load-time OOM or, on malloc failure, a NULL deref via
+ * b[got]=0. Cap the size, NULL-check the alloc, require a full read. Returns a
+ * malloc'd NUL-terminated buffer, or NULL on any failure. Mirrors tok.h tk_read_file. */
+#define CFG_MAX_BYTES (256ll<<20)   /* config/oracle JSON is KB-MB in practice */
+static char* cfg_slurp(const char *path){
+    FILE *f=fopen(path,"rb"); if(!f) return NULL;
+    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+    if(n<0 || (long long)n>CFG_MAX_BYTES){ fclose(f); return NULL; }
+    char *b=malloc((size_t)n+1); if(!b){ fclose(f); return NULL; }
+    size_t got=fread(b,1,(size_t)n,f); fclose(f);
+    if((long)got!=n){ free(b); return NULL; }
+    b[got]=0; return b;
+}
 static jval* cfg_root(const char *snap, char **arena){
     char p[2048]; snprintf(p,sizeof(p),"%s/config.json",snap);
-    FILE *f=fopen(p,"rb"); if(!f){perror(p);exit(1);}
-    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-    char *b=malloc(n+1); size_t got=fread(b,1,n,f); b[got]=0; fclose(f);
-    if((long)got!=n) fprintf(stderr,"warning: short read on %s (%ld of %ld)\n",p,(long)got,n);
+    char *b=cfg_slurp(p);
+    if(!b){ fprintf(stderr,"%s: cannot read config.json (missing, unreadable, short, or > %lld bytes)\n",p,(long long)CFG_MAX_BYTES); exit(1); }
     return json_parse(b,arena);
 }
 static int gi(jval*r,const char*k){ jval*v=json_get(r,k); return v?(int)v->num:0; }
@@ -6528,10 +6541,8 @@ int main(int argc, char **argv){
 
     /* altrimenti: validazione contro l'oracolo (ref_glm.json) */
     const char *refpath=getenv("REF")?getenv("REF"):"ref_glm.json";
-    FILE *f=fopen(refpath,"rb"); if(!f){perror(refpath);return 1;}
-    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-    char *b=malloc(n+1); size_t got=fread(b,1,n,f); b[got]=0; fclose(f);
-    if((long)got!=n) fprintf(stderr,"warning: short read on %s (%ld of %ld)\n",refpath,(long)got,n);
+    char *b=cfg_slurp(refpath);
+    if(!b){ fprintf(stderr,"%s: cannot read oracle file (missing, unreadable, short, or > %lld bytes)\n",refpath,(long long)CFG_MAX_BYTES); return 1; }
     char *ar=NULL; jval *ref=json_parse(b,&ar);
     int np=0,nfull=0; int *prompt=read_arr(ref,"prompt_ids",&np); int *full=read_arr(ref,"full_ids",&nfull);
     if(!prompt||!full||np<1||nfull<np){ fprintf(stderr,"ref file missing prompt_ids/full_ids or empty\n"); return 1; }
