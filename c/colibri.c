@@ -163,6 +163,7 @@ typedef struct {
     KVState *kv;
     ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
     float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* ombra KV su device (decode) */
+    float **ln_dev;                              /* in_ln/post_ln cached on device: [layer*2+{0,1}] (Inc.4) */
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
     uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
@@ -242,6 +243,7 @@ static int qt_cuda_update(QT *t){
                         t->fmt==1?(const void*)t->q8:(const void*)t->q4;
     return coli_cuda_tensor_update(t->cuda,weights,t->s);
 }
+static double g_ovl_issue,g_ovl_cpu,g_ovl_take,g_ovl_mark; /* Inc.4 overlap-window split (OVL report) */
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
     fprintf(stderr,"[CUDA] resident set: %zu tensors, %.2f GB VRAM\n",n,b/1e9);
@@ -257,6 +259,9 @@ static void cuda_stats_print(void){
         getenv("COLI_CUDA_PROFILE")?"; timing sotto":"");
     if(calls&&getenv("COLI_CUDA_PROFILE")) fprintf(stderr,
         "[CUDA] expert groups timing: H2D %.1f ms | kernel %.1f ms | D2H %.1f ms\n",h2d,kernel,d2h);
+    if(g_ovl_issue+g_ovl_cpu+g_ovl_take>0) fprintf(stderr,
+        "[CUDA] overlap window: pack+issue %.2fs | cpu-rows %.2fs | take(sync+acc) %.2fs\n",
+        g_ovl_issue,g_ovl_cpu,g_ovl_take);
 }
 static int parse_cuda_devices(const char *list, int *out){
     if(!list||!*list) return 0;
@@ -2597,10 +2602,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     for(int di=0;di<g_cuda_ndev && all;di++) if(pd_nc[di])
                         all=issued[di]=coli_cuda_expert_group_issue(pd_g[di],pd_u[di],pd_d[di],
                                 pd_rows[di],pd_nc[di],group_x+(int64_t)pd_off[di]*D);
+                    g_ovl_issue+=now_s()-tg0;
                     if(all){
                         static int announced2;
                         if(!announced2){ announced2=1; fprintf(stderr,"[CUDA] expert group overlap active\n"); }
-                        early_issued=1;
+                        early_issued=1; g_ovl_mark=now_s();
                         for(int q=0;q<npg;q++) done_j[pg_j[q]]=1;
                         /* stash packing for the take phase */
                         for(int di=0;di<g_cuda_ndev;di++){ dev_nc0[di]=pd_nc[di]; dev_off0[di]=pd_off[di]; dev_total0[di]=pd_total[di];
@@ -2676,6 +2682,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * (expert_host_ensure reloads slabs released by CUDA_RELEASE_HOST). */
         if(early_issued){
             double tg1=now_s();
+            g_ovl_cpu+=tg1-g_ovl_mark;               /* CPU-row window between issue and take */
             for(int di=0;di<g_cuda_ndev;di++) if(dev_nc0[di]){
                 const float *hy=coli_cuda_expert_group_take(g_cuda_devices[di]);
                 int cur=0;
@@ -2698,7 +2705,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     cur+=nr;
                 }
             }
-            m->t_emm+=now_s()-tg1;
+            m->t_emm+=now_s()-tg1; g_ovl_take+=now_s()-tg1;
         }
         ColiCudaTensor *dev_g[COLI_CUDA_MAX_DEVICES][64],*dev_u[COLI_CUDA_MAX_DEVICES][64];
         ColiCudaTensor *dev_d[COLI_CUDA_MAX_DEVICES][64];
@@ -3194,17 +3201,28 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     if(!l->sh_gate.cuda_eligible||!l->sh_up.cuda_eligible||!l->sh_down.cuda_eligible||
        !qt_cuda_upload(&l->sh_gate)||!qt_cuda_upload(&l->sh_up)||!qt_cuda_upload(&l->sh_down)||
        l->sh_gate.cuda_device!=dev||l->sh_up.cuda_device!=dev||l->sh_down.cuda_device!=dev) return 0;
-    float *w_in =coli_cuda_pipe_scratch(dev,8,(size_t)D*4);
-    float *w_post=coli_cuda_pipe_scratch(dev,9,(size_t)D*4);
+    /* Inc.4: the layernorm weights are constants — upload once per layer and keep them
+     * on the layer's device, instead of two synchronous 24 KB uploads per layer per
+     * token (152 sync H2D/token measured on the profile). */
+    if(!m->ln_dev) m->ln_dev=calloc((size_t)(c->n_layers+1)*2,sizeof(float*));
+    float *w_in=m->ln_dev[(size_t)li*2], *w_post=m->ln_dev[(size_t)li*2+1];
+    if(!w_in){
+        w_in=coli_cuda_pipe_alloc(dev,(size_t)D*4);
+        if(!w_in||!coli_cuda_pipe_upload(dev,w_in,l->in_ln,(size_t)D*4)) return 0;
+        m->ln_dev[(size_t)li*2]=w_in;
+    }
+    if(!w_post){
+        w_post=coli_cuda_pipe_alloc(dev,(size_t)D*4);
+        if(!w_post||!coli_cuda_pipe_upload(dev,w_post,l->post_ln,(size_t)D*4)) return 0;
+        m->ln_dev[(size_t)li*2+1]=w_post;
+    }
     float *nrm_d=coli_cuda_pipe_scratch(dev,10,xb);
     float *y_d  =coli_cuda_pipe_scratch(dev,11,xb);
     float *sg_d =coli_cuda_pipe_scratch(dev,12,(size_t)S*sI*4);
     float *su_d =coli_cuda_pipe_scratch(dev,13,(size_t)S*sI*4);
     float *snap =coli_cuda_pipe_scratch(dev,14,xb);
-    if(!w_in||!w_post||!nrm_d||!y_d||!sg_d||!su_d||!snap) return 0;
+    if(!nrm_d||!y_d||!sg_d||!su_d||!snap) return 0;
     if(!coli_cuda_pipe_peer_copy(dev,snap,dev,x_dev,xb)) return 0;   /* snapshot per il fallback */
-    if(!coli_cuda_pipe_upload(dev,w_in,l->in_ln,(size_t)D*4)||
-       !coli_cuda_pipe_upload(dev,w_post,l->post_ln,(size_t)D*4)) return 0;
     double ta=now_s();
     if(!coli_cuda_pipe_rmsnorm(dev,nrm_d,x_dev,w_in,S,D,c->eps)) return 0;
     /* DSA: i layer con indexer FULL cachano k_idx dalla nrm pre-attention (CPU, piccolo) */
