@@ -397,24 +397,72 @@ def main():
         # Ora il ramo locale rispecchia il download path: prefisso corretto,
         # flag passate, shard vuoti saltati.
         prefix = "out-mtp-" if a.mtp else "out-idx-" if a.indexer else "out-"
-        n = 0
+        # RIPRESA (#383): i nomi out-NNNNN contano gli shard EMESSI, non l'indice di
+        # input (gli shard senza tensori rilevanti non producono file), quindi "il
+        # file esiste" non basta per saltare il lavoro gia' fatto. Un manifest
+        # sidecar ricorda input -> output (o "vuoto") e con quali parametri: la
+        # ripresa salta solo cio' che combacia, e parametri diversi sulla stessa
+        # outdir vengono rifiutati invece di mescolare container (il modo #355).
+        # EN: RESUME (#383): out-NNNNN names count EMITTED shards, not the input
+        # EN: index (shards with no relevant tensors emit no file), so "the file
+        # EN: exists" is not enough to skip completed work. A sidecar manifest
+        # EN: records input -> output (or "empty") plus the conversion parameters:
+        # EN: resume skips only what matches, and different parameters on the same
+        # EN: outdir are refused instead of mixing containers (the #355 failure mode).
+        params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
+                  "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map}
+        prog_path = os.path.join(a.outdir, f".{prefix}progress.json")
+        prog = {}
+        if os.path.exists(prog_path):
+            try: prog = json.loads(open(prog_path).read())
+            except (OSError, ValueError): prog = {}
+            if prog and prog.get("params") != params:
+                print(f"ERROR: {prog_path} records a conversion with {prog.get('params')};\n"
+                      f"       this run uses {params}. Refusing to mix conversions in the same "
+                      f"outdir — use a fresh --outdir (or delete the manifest and the "
+                      f"{prefix}*.safetensors shards to redo).")
+                return
+        done = prog.setdefault("shards", {}); prog["params"] = params
+        n = 0; fresh = 0; skipped = 0
         for i, sp in enumerate(shards):
+            key = os.path.basename(sp)
+            prev = done.get(key)                          # None = mai visto; "" = visto, vuoto; nome = emesso
+            if prev is not None and (prev == "" or os.path.exists(os.path.join(a.outdir, prev))):
+                if prev: n += 1
+                skipped += 1
+                continue
             out = {}
             convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits,
                           keep_mtp=a.mtp, keep_idx=a.indexer,
                           group_size=a.group_size, bits_map=bits_map)
             if not out:                                   # shard senza MTP/idx: niente file (come il download path)
-                continue
-            save_file(out, os.path.join(a.outdir, f"{prefix}{n:05d}.safetensors"))
-            n += 1
-        # config/tokenizer solo per la conversione principale — i passaggi mtp/idx
-        # vanno nella stessa outdir di un container gia' completo di metadati.
+                done[key] = ""
+            else:
+                name = f"{prefix}{n:05d}.safetensors"
+                save_file(out, os.path.join(a.outdir, name))
+                done[key] = name; n += 1; fresh += 1
+            tmp_prog = prog_path + ".tmp"                 # scrittura atomica: una ripresa non vede mai un manifest mezzo scritto
+            with open(tmp_prog, "w") as f: json.dump(prog, f, indent=1)   # EN: atomic write: a resume never sees a half-written manifest
+            os.replace(tmp_prog, prog_path)
+        if skipped: print(f"[RESUME] {skipped} shard(s) already done in {a.outdir}, skipped")
+        # metadati per la conversione principale: gli stessi quattro file del download
+        # path — senza tokenizer.json chat/serve non partono. I passaggi mtp/idx vanno
+        # nella stessa outdir di un container gia' completo di metadati.
+        # EN: metadata for the main pass: the same four files as the download path —
+        # EN: chat/serve won't start without tokenizer.json. The mtp/idx passes target
+        # EN: an outdir whose container already has its metadata.
         if not a.mtp and not a.indexer:
-            for fn in ["config.json"]:
+            copied, missing = [], []
+            for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
                 src = os.path.join(a.indir, fn)
-                if os.path.exists(src): shutil.copy(src, a.outdir)
+                if os.path.exists(src): shutil.copy(src, a.outdir); copied.append(fn)
+                else: missing.append(fn)
+            print(f"[META] copied from {a.indir}: {', '.join(copied) if copied else 'nothing'}")
+            if missing:
+                print(f"[META] WARNING: not found in {a.indir}: {', '.join(missing)}"
+                      + (" — chat/serve need tokenizer.json" if "tokenizer.json" in missing else ""))
         tag = "MTP" if a.mtp else "indexer" if a.indexer else "main"
-        print(f"converted {n} {tag} shard(s) -> {a.outdir} ({prefix}NNNNN)")
+        print(f"converted {fresh} {tag} shard(s), {n} in container -> {a.outdir} ({prefix}NNNNN)")
         return
 
     # reale: scarica shard per shard, converte, cancella
