@@ -389,6 +389,25 @@ def main():
     if a.indir:    # conversione locale (test)
         shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
         from safetensors.numpy import save_file
+        # #383: se l'indice c'e', i passaggi --mtp/--indexer convertono SOLO gli shard
+        # che contengono i tensori richiesti (3 invece di scandire tutti i 141 — ogni
+        # scansione a vuoto apre comunque uno shard da 5 GB). Senza indice: scansione
+        # completa come prima.
+        # EN: #383: when the index is present, the --mtp/--indexer passes convert ONLY
+        # the shards that hold the requested tensors (3 instead of scanning all 141 —
+        # every empty scan still opens a 5 GB shard). Without the index: full scan as
+        # before.
+        if a.mtp or a.indexer:
+            idxp = os.path.join(a.indir, "model.safetensors.index.json")
+            if os.path.exists(idxp):
+                wmap = json.load(open(idxp))["weight_map"]
+                if a.mtp:
+                    want = {v for k, v in wmap.items() if k.startswith(f"model.layers.{a.n_layers}.")}
+                else:
+                    want = {v for k, v in wmap.items() if "indexer" in k and 0 <= layer_idx(k) < a.n_layers}
+                keep = [sp for sp in shards if os.path.basename(sp) in want]
+                print(f"[PLAN] index: {len(keep)}/{len(shards)} local shard(s) hold the requested tensors")
+                shards = keep
         # BUG #355: questo ramo ignorava --mtp/--indexer. Con --mtp scriveva
         # out-NNNNN (gli STESSI nomi di una conversione normale) in ebits=8 e
         # keep_mtp=False -> il "secondo passaggio MTP" nella stessa outdir
