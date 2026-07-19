@@ -1336,7 +1336,12 @@ static jval* cfg_root(const char *snap, char **arena){
     char p[2048]; snprintf(p,sizeof(p),"%s/config.json",snap);
     FILE *f=fopen(p,"rb"); if(!f){perror(p);exit(1);}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-    char *b=malloc(n+1); size_t got=fread(b,1,n,f); b[got]=0; fclose(f);
+    /* SEC: config.json arriva dalla dir modello non fidata. Limita la dimensione
+     * (un file ostile enorme = OOM al load) e controlla la malloc: senza il NULL
+     * check, b[got]=0 su malloc fallita era un NULL-deref. */
+    if(n<0 || n>(256L<<20)){ fprintf(stderr,"%s: size %ld out of range (0..256 MB)\n",p,n); exit(1); }
+    char *b=malloc((size_t)n+1); if(!b){ fprintf(stderr,"OOM reading %s (%ld bytes)\n",p,n); exit(1); }
+    size_t got=fread(b,1,(size_t)n,f); b[got]=0; fclose(f);
     if((long)got!=n) fprintf(stderr,"warning: short read on %s (%ld of %ld)\n",p,(long)got,n);
     return json_parse(b,arena);
 }
@@ -1375,8 +1380,9 @@ static void load_cfg(Cfg *c, const char *snap){
       FILE *gf=fopen(gp,"rb");                  /* assente = nessun problema: e' opzionale */
       if(gf){
         fseek(gf,0,SEEK_END); long gn=ftell(gf); fseek(gf,0,SEEK_SET);
-        if(gn>0){
-            char *gb=malloc(gn+1); size_t gg=fread(gb,1,gn,gf); gb[gg]=0;
+        char *gb = (gn>0 && gn<=(256L<<20)) ? malloc((size_t)gn+1) : NULL;   /* SEC: cap + NULL check */
+        if(gb){
+            size_t gg=fread(gb,1,(size_t)gn,gf); gb[gg]=0;
             char *ga=NULL; jval *gr=json_parse(gb,&ga);
             jval *ge=gr?json_get(gr,"eos_token_id"):NULL;
             if(ge){
@@ -1445,6 +1451,27 @@ static int detect_group_size(int O, int I, int64_t ns){
     return 0;
 }
 
+/* SEC: risolve e VALIDA il formato quantizzato di un tensore [O,I] letto da un
+ * container non fidato (mirror). L'inferenza precedente (`?1:?2:3`) cadeva su
+ * int2 per QUALSIASI conteggio byte non riconosciuto: un peso troppo corto
+ * diventava un int2 valido e il matmul leggeva oltre il buffer (O*I nibble a
+ * 4/byte). Qui i byte del peso devono corrispondere a un layout noto e i byte
+ * della scala alla cardinalita' attesa (O per-row, O*ng per-gruppo) — altrimenti
+ * si termina invece di sforare. Ritorna fmt (1/2/3/4) e scrive *gs. */
+static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs){
+    int64_t exp_i8=(int64_t)O*I, exp_i4=(int64_t)O*((I+1)/2), exp_i2=(int64_t)O*((I+3)/4);
+    int fmt = (nb==exp_i8)?1 : (nb==exp_i4)?2 : (nb==exp_i2)?3 : 0;
+    if(!fmt){
+        fprintf(stderr,"%s: quantized weight is %lld bytes — no int8/int4/int2 layout for [%d,%d], refusing (untrusted container)\n",
+                name,(long long)nb,O,I); exit(1); }
+    *gs=0;
+    if(fmt==2){ int g=detect_group_size(O,I,ns); if(g>0){ fmt=4; *gs=g; } }
+    int64_t exp_scale = (fmt==4)? (int64_t)O*((I+*gs-1)/(*gs)) : (int64_t)O;   /* in FLOAT */
+    if(ns != exp_scale*4){
+        fprintf(stderr,"%s: scale array is %lld bytes — expected %lld for [%d,%d] fmt=%d, refusing (untrusted container)\n",
+                name,(long long)ns,(long long)(exp_scale*4),O,I,fmt); exit(1); }
+    return fmt;
+}
 /* costruisce un QT [O,I] dal disco in `t` (buffer riusabili tra chiamate).
  *  - se esiste `name.qs`: pesi GIA' quantizzati nel container (U8 qdata + F32 scala) -> letti diretti
  *  - altrimenti: tensore pieno (f32/bf16) -> quantizzato a runtime a `bits` (oracolo tiny / pesi pieni)
@@ -1454,12 +1481,11 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
     if(st_has(&m->S,sn)){
         int64_t nb=st_nbytes(&m->S,name);
         int64_t ns=st_nbytes(&m->S,sn);   /* scale bytes (F32) */
-        /* Detect int4-grouped (fmt=4): packed int4 weight bytes BUT scale array is
-         * larger than O*4 — the group size is derived from the scale-array size. */
-        int fmt = (nb==(int64_t)O*I)?1 : (nb==(int64_t)O*((I+1)/2))?2 : 3;
+        /* fmt=4 int4-grouped: byte int4 ma scala > O*4 — gs deriva dalla scala.
+         * qt_resolve_fmt valida entrambi i conteggi contro [O,I] e termina se
+         * non fidati (SEC). */
         int gs=0;
-        if(fmt==2) gs=detect_group_size(O,I,ns);
-        if(gs>0) fmt=4;
+        int fmt = qt_resolve_fmt(name,O,I,nb,ns,&gs);
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else if(fmt==4){ int ng=(I+gs-1)/gs;
             if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
@@ -1802,11 +1828,8 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
             QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
             for(int k=0;k<3;k++){
                 int64_t nb=tw[k]->nbytes;
-                int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
-                /* detect grouped int4 (fmt=4): int4 weight bytes + larger scale array */
                 int gs=0;
-                if(fmt==2) gs=detect_group_size(OO[k],II[k],tq[k]->nbytes);
-                if(gs>0) fmt=4;
+                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs);
                 qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
@@ -1931,10 +1954,8 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
     QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
     for(int k=0;k<3;k++){
         int64_t nb=tw[k]->nbytes;
-        int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;
         int gs=0;
-        if(fmt==2) gs=detect_group_size(OO[k],II[k],tq[k]->nbytes);
-        if(gs>0) fmt=4;
+        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs);
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
