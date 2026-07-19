@@ -567,10 +567,13 @@ static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (
  * there is nothing to migrate. */
 #ifdef __linux__
 static int g_numa_nodes=0;      /* only touched under __linux__; off-Linux NUMA is a no-op */
+static int g_numa_skip_bind=0;  /* raised around the GPU-prefix pin load: those slabs are
+                                 * upload staging, freed right after — binding them buys
+                                 * nothing and costs ~2 transient VMAs each (#419) */
 #endif
 static void numa_slab_bind(void *p, size_t n){
 #ifdef __linux__
-    if(g_numa_nodes<2 || !p || !n) return;
+    if(g_numa_nodes<2 || g_numa_skip_bind || !p || !n) return;
     unsigned long mask=(1UL<<g_numa_nodes)-1;
     uintptr_t a=(uintptr_t)p & ~(uintptr_t)4095;
     size_t len=(((uintptr_t)p+n+4095) & ~(uintptr_t)4095) - a;
@@ -5127,9 +5130,15 @@ static void pin_load(Model *m, const char *statspath, double gb){
 #endif
     /* Load the VRAM-ranked prefix first.  Once uploaded its host backing is
      * released before the disjoint RAM-ranked suffix is allocated. */
+#ifdef __linux__
+    if(gpu_prefix>0) g_numa_skip_bind=1;   /* prefix slabs = transient upload staging: don't bind (#419) */
+#endif
     #pragma omp parallel for schedule(dynamic,1)
     for(int a=0;a<(gpu_prefix?gpu_prefix:npin);a++)
         expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
+#ifdef __linux__
+    g_numa_skip_bind=0;
+#endif
     m->resident_bytes+=(int64_t)(gpu_prefix?gpu_prefix:npin)*eb;
 #ifdef COLI_CUDA
     if(g_cuda_enabled && budget>0){
