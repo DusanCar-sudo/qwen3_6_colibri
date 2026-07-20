@@ -120,7 +120,7 @@
           };
         };
 
-        formatter = (import nixpkgs {inherit system;}).alejandra;
+        formatter = pkgs.alejandra;
 
         devShells.default = pkgs.mkShell {
           inputsFrom = [colibri];
