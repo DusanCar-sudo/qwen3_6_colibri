@@ -106,9 +106,24 @@ KV configuration actually allows.
 URL to `http://localhost:8000/v1`, the model to `glm-5.2-colibri`, and any dummy
 key (`OPENAI_API_KEY` / `OPENAI_BASE_URL` for env-based tools).
 
-> On the CPU-streaming path a large model decodes at roughly 1 tok/s, so
-> interactive agent loops will feel slow — it connects and works, but the latency
-> is very different from a hosted model.
+> **Set your expectations before connecting an agentic CLI.** Two costs dominate,
+> and the first one is invisible until you know it's there:
+>
+> 1. **Prefill.** Coding agents (crush, aider in repo-map mode, Cline, …) send a
+>    large system prompt plus tool definitions — often 10–20k tokens — *before
+>    your first word*. Prefill on the CPU-streaming path runs at a few tokens per
+>    second (it is attention-bound, see #153), so a 15k-token agent preamble is
+>    **an hour of silent "thinking" before the first output token**. The client
+>    looks hung; it isn't. Smoke-test with the tiny `curl` above first — if that
+>    answers in about a minute, the pipeline works and what you're paying for is
+>    prompt size.
+> 2. **Decode.** Roughly 1 tok/s for a large model, so multi-turn agent loops
+>    (which re-pay the growing context every turn) compound the cost.
+>
+> Practical guidance: single surgical asks with a short context work; iterative
+> agent sessions against a disk-streaming 744B model do not resemble a hosted
+> API and mostly won't be worth the wait. If your client lets you trim or disable
+> its system preamble and tool catalog, do it.
 
 ## Isolated KV contexts
 
