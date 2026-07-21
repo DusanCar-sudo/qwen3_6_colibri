@@ -214,6 +214,8 @@ _BOX_RE  = re.compile(re.escape(BOX_START) + r"(.*?)" + re.escape(BOX_END), re.D
 _ARG_RE  = re.compile(r"<arg_key>([^<]*)</arg_key><arg_value>(.*?)</arg_value>", re.DOTALL)
 _NAME_RE = re.compile(r"\s*([A-Za-z0-9_.\-]+)")
 _TAG_RE  = re.compile(r"</?arg_key>|</?arg_value>")
+# A closing tag the model started but never finished ("</tool_cal", "</tool"), at end of reply.
+_PARTIAL_END_RE = re.compile(r"<(?:/(?:t(?:o(?:o(?:l(?:_(?:c(?:a(?:l)?)?)?)?)?)?)?)?)?\Z")
 
 # De-mangler: opt-in recovery for heavily-quantized models that drop the
 # <arg_key>K</arg_key><arg_value> structure. Default OFF (never rewrites well-formed output).
@@ -275,14 +277,41 @@ def _coerce_arg(value, declared):
     return parsed
 
 
+def _unclosed_tail(reply, tools):
+    """Body of a trailing <tool_call> that was never closed, or None.
+
+    Only returned when the recovery is unambiguous, so ordinary prose that merely mentions
+    "<tool_call>" can never be turned into a call. Both conditions must hold:
+      * the last BOX_START is not followed by a BOX_END (a closed box is the strict parser's job);
+      * the tail carries a complete <arg_key>..</arg_value> pair, OR it is exactly the name of a
+        tool the client declared (the zero-argument case).
+    """
+    start = reply.rfind(BOX_START)
+    if start < 0 or BOX_END in reply[start:]:
+        return None
+    inner = _PARTIAL_END_RE.sub("", reply[start + len(BOX_START):])
+    if _ARG_RE.search(inner):
+        return inner
+    declared = {(t.get("function", t) if isinstance(t, dict) else {}).get("name")
+                for t in (tools or []) if isinstance(t, dict)}
+    return inner if inner.strip() in declared else None
+
+
 def parse_tool_calls(reply, tools=None):
     """Return (content, tool_calls). Strict GLM parse; optional de-mangler (COLI_TOOL_SALVAGE=1)
     rescues malformed int4 output by mapping a lone payload onto the tool's primary parameter."""
     param_order = _tool_param_order(tools)
     param_types = _tool_param_types(tools)
     calls, salvaged = [], []
-    for match in _BOX_RE.finditer(reply):
-        inner = match.group(1)
+    # #401: a box the model opened but never closed -- it ran out of budget, or the closing tag
+    # came out mangled ("</tool_cal"). The call itself is often perfectly well-formed, but the
+    # strict regex needs BOTH tags, so the client used to get *zero* tool_calls. Recover the tail,
+    # but only when it is unambiguous (see _unclosed_tail) so prose can never fabricate a call.
+    boxes = [m.group(1) for m in _BOX_RE.finditer(reply)]
+    tail = _unclosed_tail(reply, tools)
+    if tail is not None:
+        boxes.append(tail)
+    for inner in boxes:
         name_match = _NAME_RE.match(inner)
         name = name_match.group(1) if name_match else inner.strip()
         args = {}
@@ -314,13 +343,17 @@ def parse_tool_calls(reply, tools=None):
                          "parsed -- output may be quantization-mangled; try COLI_TOOL_SALVAGE=1\n")
         sys.stderr.flush()
     text = _BOX_RE.sub("", reply)
+    if tail is not None:                       # drop the recovered tail from the visible content
+        text = text[:text.rindex(BOX_START)]
     if THINK_CLOSE in text:
         text = text.split(THINK_CLOSE, 1)[1]
     text = text.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
     if calls:
-        dm = len(salvaged)
-        sys.stderr.write("[api] tool-calls: %d total, %d strict, %d de-mangled [%s]%s\n"
-                         % (len(calls), len(calls) - dm, dm, "CLEAN" if dm == 0 else "DE-MANGLED",
+        dm, rec = len(salvaged), (1 if tail is not None else 0)
+        sys.stderr.write("[api] tool-calls: %d total, %d strict, %d unclosed-recovered, "
+                         "%d de-mangled [%s]%s\n"
+                         % (len(calls), max(0, len(calls) - dm - rec), rec, dm,
+                            "CLEAN" if dm == 0 and rec == 0 else "RECOVERED",
                             (" -> " + ", ".join(salvaged)) if dm else ""))
         sys.stderr.flush()
     return text.strip(), calls

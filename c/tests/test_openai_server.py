@@ -706,6 +706,65 @@ class EngineErrorFrameTest(unittest.TestCase):
         err = _engine_error(["CONTEXT_EXCEEDED"], "CONTEXT_EXCEEDED")
         self.assertIsInstance(err, APIError)
         self.assertEqual(err.status, 400)
+class UnclosedToolCallTest(unittest.TestCase):
+    """#401: the model opens <tool_call>, emits a well-formed call, then stops without the
+    closing tag (budget ran out, or quantization mangled it). The strict regex needs both tags,
+    so the client used to get zero tool_calls -- a total failure from a recoverable output."""
+
+    NO_ARG_TOOL = ORDER_TOOL + [{"type": "function",
+                                 "function": {"name": "list_orders", "parameters": {}}}]
+
+    def _calls(self, reply, tools=ORDER_TOOL):
+        return parse_tool_calls(reply, tools)
+
+    def test_unclosed_box_is_recovered(self):
+        content, calls = self._calls("<tool_call>lookup_order"
+                                     "<arg_key>order_id</arg_key><arg_value>A-1</arg_value>")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"order_id": "A-1"})
+        self.assertEqual(content, "")
+
+    def test_mangled_closing_tag_is_recovered(self):
+        _, calls = self._calls("<tool_call>lookup_order"
+                               "<arg_key>order_id</arg_key><arg_value>A-1</arg_value></tool_cal")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"order_id": "A-1"})
+
+    def test_leading_prose_is_kept_as_content(self):
+        content, calls = self._calls("Let me check.\n<tool_call>lookup_order"
+                                     "<arg_key>order_id</arg_key><arg_value>A-1</arg_value>")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(content, "Let me check.")
+
+    def test_closed_call_followed_by_an_unclosed_one(self):
+        _, calls = self._calls("<tool_call>lookup_order"
+                               "<arg_key>order_id</arg_key><arg_value>A-1</arg_value></tool_call>"
+                               "<tool_call>lookup_order"
+                               "<arg_key>order_id</arg_key><arg_value>B-2</arg_value>")
+        self.assertEqual([json.loads(c["function"]["arguments"])["order_id"] for c in calls],
+                         ["A-1", "B-2"])
+
+    def test_bare_declared_name_recovers_a_zero_argument_call(self):
+        _, calls = self._calls("<tool_call>list_orders", self.NO_ARG_TOOL)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "list_orders")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {})
+
+    def test_prose_mentioning_the_marker_does_not_fabricate_a_call(self):
+        content, calls = self._calls("To call a tool, write <tool_call> and then the name.")
+        self.assertEqual(calls, [])
+        self.assertIn("<tool_call>", content)
+
+    def test_undeclared_name_without_arguments_is_not_recovered(self):
+        _, calls = self._calls("<tool_call>drop_all_tables")
+        self.assertEqual(calls, [])
+
+    def test_well_formed_output_is_untouched(self):
+        content, calls = self._calls("Done.<tool_call>lookup_order"
+                                     "<arg_key>order_id</arg_key><arg_value>A-1</arg_value>"
+                                     "</tool_call>")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(content, "Done.")
 
 
 class ToolChoiceTest(unittest.TestCase):
