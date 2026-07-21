@@ -59,6 +59,24 @@ def error_object(error):
                       "param": error.param, "code": error.code}}
 
 
+def _engine_error(fields, message):
+    """Turn an engine ERROR frame into the right exception type.
+
+    CONTEXT_EXCEEDED is a client mistake, not a server fault: the prompt is longer than the
+    engine's context. Report it the way every OpenAI-compatible server does, so clients that
+    know how to compact a conversation actually get the chance to (previously the engine
+    silently truncated the prompt instead, which is #401)."""
+    if fields and fields[0] == "CONTEXT_EXCEEDED":
+        limit = fields[2] if len(fields) > 2 else "the context"
+        used = fields[1] if len(fields) > 1 else "?"
+        return APIError(400,
+                        f"This model's maximum context length is {limit} tokens, however your "
+                        f"messages resulted in at least {used} tokens. Please shorten the "
+                        f"conversation, or restart the server with a larger CTX.",
+                        "messages", "context_length_exceeded")
+    return RuntimeError(message)
+
+
 class GenerationScheduler:
     """Bounded FIFO admission for the engine's independent KV contexts."""
 
@@ -652,7 +670,7 @@ class Engine:
                     with self.pending_lock:
                         events = self.pending.pop(request_id, None)
                     if events is not None:
-                        events.put(("error", RuntimeError(message)))
+                        events.put(("error", _engine_error(fields[2:], message)))
                 else:
                     raise RuntimeError(f"invalid engine response: {' '.join(fields)}")
         except Exception as error:

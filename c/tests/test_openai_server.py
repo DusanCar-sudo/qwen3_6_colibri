@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 from pathlib import Path
 
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled, END, GenerationScheduler,
-                           READY, Engine, generation_options, parse_tool_calls,
+                           READY, Engine, _engine_error, generation_options, parse_tool_calls,
                            read_engine_turn, render_chat, serve)
 
 
@@ -680,6 +680,32 @@ class ToolArgumentTypeTest(unittest.TestCase):
         args = self._args("<tool_call>lookup_order"
                           "<arg_key>extra</arg_key><arg_value>7</arg_value></tool_call>")
         self.assertEqual(args["extra"], 7)
+
+
+class EngineErrorFrameTest(unittest.TestCase):
+    """#401: an over-long prompt used to be silently truncated to the first CTX-2 tokens, so the
+    model answered from a mutilated prompt and the client got HTTP 200 with junk. The engine now
+    refuses, and the refusal has to reach the client as a 400 it can act on -- not a 500."""
+
+    def test_context_exceeded_becomes_a_400_the_client_can_act_on(self):
+        err = _engine_error(["CONTEXT_EXCEEDED", "8321", "4094"], "CONTEXT_EXCEEDED 8321 4094")
+        self.assertIsInstance(err, APIError)
+        self.assertEqual(err.status, 400)
+        self.assertEqual(err.code, "context_length_exceeded")
+        self.assertEqual(err.param, "messages")
+        self.assertIn("4094", err.message)
+        self.assertIn("8321", err.message)
+
+    def test_other_engine_errors_stay_runtime_errors(self):
+        for frame in (["SLOT_BUSY"], ["BAD_REQUEST"], []):
+            err = _engine_error(frame, " ".join(frame) or "engine request failed")
+            self.assertIsInstance(err, RuntimeError)
+            self.assertNotIsInstance(err, APIError)
+
+    def test_malformed_context_frame_does_not_crash_the_dispatcher(self):
+        err = _engine_error(["CONTEXT_EXCEEDED"], "CONTEXT_EXCEEDED")
+        self.assertIsInstance(err, APIError)
+        self.assertEqual(err.status, 400)
 
 
 class ToolChoiceTest(unittest.TestCase):

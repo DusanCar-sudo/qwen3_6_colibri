@@ -5092,9 +5092,25 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     ServeCtx *sc=&ctx[sub.slot]; kv_bind(m,&sc->kv);
     int *tmp=malloc(maxctx*sizeof(int));
     if(!tmp){ fprintf(stderr,"OOM mux_submit tmp\n"); free(raw); free(line); exit(1); }
-    int nt=tok_encode(T,raw,(int)sub.bytes,tmp,maxctx-2);
+    /* Encode with one token of headroom (maxctx-1, buffer is maxctx) purely to DETECT overflow:
+     * tok_encode stops dead at its cap and returns no signal that it ran out, so encoding at the
+     * real limit silently truncates an over-long prompt to its first maxctx-2 tokens. That is the
+     * #401 field failure: a coding client's system prompt alone exceeded CTX=4096, the tail --
+     * the tool instructions and the actual user turn -- was dropped, the model saw a prompt cut
+     * mid-markup and emitted a bare "<". Retries were identical because the surviving *head*
+     * never changes when a client appends to the end (hence "prefill 0" on every retry).
+     * Refuse loudly instead; the gateway turns this into a 400 context_length_exceeded. */
+    int nt=tok_encode(T,raw,(int)sub.bytes,tmp,maxctx-1);
     free(raw); free(line);
     if(nt<1){ free(tmp); printf("ERROR %llu EMPTY_PROMPT\n",sub.id); fflush(stdout); return 0; }
+    if(nt>maxctx-2){
+        free(tmp);
+        fprintf(stderr,"[API] prompt does not fit: >=%d token, context is %d (CTX=%d). "
+                       "Raise it, e.g. CTX=32768 -- coding clients send large system prompts.\n",
+                nt,maxctx-2,maxctx);
+        printf("ERROR %llu CONTEXT_EXCEEDED %d %d\n",sub.id,nt,maxctx-2);
+        fflush(stdout); return 0;
+    }
     int prefix=0; while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
         kv_disk_truncate(m,sc->len); }
