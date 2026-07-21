@@ -819,6 +819,21 @@ static void rope_interleave(float *v, int pos, const Cfg *c){
 }
 
 /* ---------- config ---------- */
+/* SEC-9: bounded slurp for untrusted config/oracle JSON. config.json arrives from
+ * unverified mirrors (see qt_check_fmt threat model); an unbounded ftell->malloc
+ * gave a hostile file a load-time OOM or, on malloc failure, a NULL deref via
+ * b[got]=0. Cap the size, NULL-check the alloc, require a full read. Returns a
+ * malloc'd NUL-terminated buffer, or NULL on any failure. Mirrors tok.h tk_read_file. */
+#define CFG_MAX_BYTES (256ll<<20)   /* config/oracle JSON is KB-MB in practice */
+static char* cfg_slurp(const char *path){
+    FILE *f=fopen(path,"rb"); if(!f) return NULL;
+    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+    if(n<0 || (long long)n>CFG_MAX_BYTES){ fclose(f); return NULL; }
+    char *b=malloc((size_t)n+1); if(!b){ fclose(f); return NULL; }
+    size_t got=fread(b,1,(size_t)n,f); fclose(f);
+    if((long)got!=n){ free(b); return NULL; }
+    b[got]=0; return b;
+}
 static jval* cfg_root(const char *snap, char **arena){
     char p[2048]; snprintf(p,sizeof(p),"%s/config.json",snap);
     FILE *f=fopen(p,"rb"); if(!f){perror(p);exit(1);}
@@ -987,11 +1002,18 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
             if(t->fmt!=5||!t->q4){ t->fmt=5; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
             st_read_raw(&m->S,name,t->q4,drop); }
         else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
-        st_read_f32(&m->S,sn,t->s,drop);
+        /* cap MUST match the scale cardinality qt_resolve_fmt already validated and
+         * the falloc above actually reserved, per format: grouped-int4 (fmt=4) keeps
+         * O*ceil(I/gs) scales and int3-g64 (fmt=5) keeps O*i3_groups(I); everything
+         * else is per-row O. Using the per-row bound for a grouped format would
+         * reject a legitimate container (fmt=5 regressed exactly that way). */
+        st_read_f32_cap(&m->S,sn,t->s,
+                        fmt==4 ? (int64_t)O*((I+gs-1)/gs) :
+                        fmt==5 ? (int64_t)O*i3_groups(I)  : (int64_t)O, drop);
     } else {
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
-        if(t->fmt==0) st_read_f32(&m->S,name,t->qf,drop);
-        else { float *tmp=falloc((int64_t)O*I); st_read_f32(&m->S,name,tmp,drop); qt_fill(t,tmp,bits); free(tmp); }
+        if(t->fmt==0) st_read_f32_cap(&m->S,name,t->qf,(int64_t)O*I,drop);
+        else { float *tmp=falloc((int64_t)O*I); st_read_f32_cap(&m->S,name,tmp,(int64_t)O*I,drop); qt_fill(t,tmp,bits); free(tmp); }
     }
 }
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
@@ -1213,6 +1235,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
 /* embed: dequantizza la riga del token (scala per-riga) in x[hidden] */
 static void embed_row(Model *m, int tok, float *x){
     int D=m->c.hidden; QT *e=&m->embed;
+    if(tok<0 || tok>=e->O){ memset(x,0,(size_t)D*sizeof(float)); return; }   /* #SEC-5: out-of-range token id -> zero row, never OOB */
     if(e->fmt==0){ memcpy(x, e->qf+(int64_t)tok*D, D*sizeof(float)); return; }
     if(e->fmt==4){ /* grouped int4: per-group scale (embed/lm_head at io_bits, usually fmt 0/1) */
         const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); int gs=e->gs,ng=(D+gs-1)/gs;
@@ -6549,10 +6572,8 @@ int main(int argc, char **argv){
 
     /* altrimenti: validazione contro l'oracolo (ref_glm.json) */
     const char *refpath=getenv("REF")?getenv("REF"):"ref_glm.json";
-    FILE *f=fopen(refpath,"rb"); if(!f){perror(refpath);return 1;}
-    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-    char *b=malloc(n+1); size_t got=fread(b,1,n,f); b[got]=0; fclose(f);
-    if((long)got!=n) fprintf(stderr,"warning: short read on %s (%ld of %ld)\n",refpath,(long)got,n);
+    char *b=cfg_slurp(refpath);
+    if(!b){ fprintf(stderr,"%s: cannot read oracle file (missing, unreadable, short, or > %lld bytes)\n",refpath,(long long)CFG_MAX_BYTES); return 1; }
     char *ar=NULL; jval *ref=json_parse(b,&ar);
     int np=0,nfull=0; int *prompt=read_arr(ref,"prompt_ids",&np); int *full=read_arr(ref,"full_ids",&nfull);
     if(!prompt||!full||np<1||nfull<np){ fprintf(stderr,"ref file missing prompt_ids/full_ids or empty\n"); return 1; }
