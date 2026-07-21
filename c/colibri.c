@@ -123,6 +123,8 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
                     * included below — keep the arithmetic literal here) */
         int64_t ng=((int64_t)t->I+63)/64;
         return (int64_t)t->O*ng*24 + (int64_t)t->O*ng*4; }
+    if(t->fmt==6)  /* E8/IQ3: 98B per 256 weights, scales in-block, .qs is a 4-byte tag */
+        return (int64_t)t->O*(((int64_t)t->I+255)/256)*98 + 4;
     return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;  /* fmt=2 int4 per-row */
 }
 
@@ -289,7 +291,7 @@ static void qt_cuda_reset(QT *t){
     t->cuda_failed=0;
 }
 static int qt_cuda_upload(QT *t){
-    if(t->fmt==5) return 0;   /* int3-g64: no CUDA kernel yet — tensor stays CPU-side */
+    if(t->fmt==5||t->fmt==6) return 0;   /* int3-g64 / E8: no CUDA kernel yet — tensor stays CPU-side */
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     if(t->fmt==4)   /* grouped int4 (#334): scales are [O, ceil(I/gs)] — the plain
@@ -963,6 +965,10 @@ static int detect_group_size(int O, int I, int64_t ns){
 static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs){
     int64_t exp_i8=(int64_t)O*I, exp_i4=(int64_t)O*((I+1)/2), exp_i2=(int64_t)O*((I+3)/4);
     int64_t exp_i3=(int64_t)O*i3_rowbytes(I);   /* int3-g64 (fmt=5): 24B per 64-input group */
+    /* fmt=6 (E8/IQ3, #452): scales live inside the 98B super-blocks, so the .qs
+     * convention is kept with a single-float tag — ns==4 is the discriminator
+     * (every other format carries at least O floats of real scales). */
+    if(ns==4 && nb==(int64_t)O*e8_rowbytes(I)){ *gs=0; return 6; }
     /* Row formats take precedence: for tiny I the int3-g64 byte count can coincide with
      * a row layout (e.g. [O,48]: ceil(48/2)=24=1*24). For real tensor shapes the counts
      * are distinct, and the weight bytes — not the scale size — are the int3 tag, because
@@ -1001,6 +1007,9 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
         else if(fmt==5){ int64_t ng=i3_groups(I);   /* int3-g64: 24B/group weights + O*ng group scales */
             if(t->fmt!=5||!t->q4){ t->fmt=5; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
             st_read_raw(&m->S,name,t->q4,drop); }
+        else if(fmt==6){   /* E8/IQ3: everything in-block, .qs is the 4-byte tag */
+            if(t->fmt!=6||!t->q4){ t->fmt=6; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(1); }
+            st_read_raw(&m->S,name,t->q4,drop); }
         else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
         /* cap MUST match the scale cardinality qt_resolve_fmt already validated and
          * the falloc above actually reserved, per format: grouped-int4 (fmt=4) keeps
@@ -1009,7 +1018,8 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
          * reject a legitimate container (fmt=5 regressed exactly that way). */
         st_read_f32_cap(&m->S,sn,t->s,
                         fmt==4 ? (int64_t)O*((I+gs-1)/gs) :
-                        fmt==5 ? (int64_t)O*i3_groups(I)  : (int64_t)O, drop);
+                        fmt==5 ? (int64_t)O*i3_groups(I)  :
+                        fmt==6 ? (int64_t)1               : (int64_t)O, drop);
     } else {
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
         if(t->fmt==0) st_read_f32_cap(&m->S,name,t->qf,(int64_t)O*I,drop);
@@ -2977,6 +2987,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     }
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
+    float *xe=NULL;   /* fmt=6: x under the rotation Q^T, built once per call — all routed
+                       * experts of the layer share it (the placement rule in quant.h) */
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
 #ifdef COLI_CUDA
     /* PIPE Inc.1b: il batch-union del prefill passa dai gruppi GPU — prima di
@@ -3289,7 +3301,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 ngroup++; continue;
             }
 #endif
-            for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
+            const float *xsrc=x;
+            if(e->g.fmt==6){
+                if(!xe){ xe=falloc((int64_t)S*D); memcpy(xe,x,(size_t)S*D*sizeof(float)); e8_rot_rows(xe,S,D); }
+                xsrc=xe;
+            }
+            for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, xsrc+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
 #ifdef COLI_CUDA
             if(!group_enabled && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible &&
@@ -3303,6 +3320,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
 #endif
             expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+            if(e->d.fmt==6) e8_rot_rows(gg,nr,I);   /* down input is per-expert — rotate here */
             matmul_qt(hh, gg, &e->d, nr);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
@@ -3467,7 +3485,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     }
 shared_done:
     free(logits_all); free(choice); free(idxs); free(ws); free(keff); free(uniq);
-    free(xg); free(gg); free(uu); free(hh); free(rows); free(rw);
+    free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(xe);
 #ifdef COLI_CUDA
     free(group_x);free(group_y);
     free(group_row); free(group_weight);

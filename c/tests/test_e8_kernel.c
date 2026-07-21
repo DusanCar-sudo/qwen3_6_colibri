@@ -81,6 +81,46 @@ int main(void) {
     }
     printf("e8 kernel oracle: O=%d I=%d, dequant exact, matmul worst rel %.2e\n", O, I, worst);
     if (worst > 1e-5) { printf("FAIL\n"); return 1; }
+
+    /* 3. rotation agreement (converter step, #452): the fixture carries a
+     * rotated-weights section — packed W@Q from the Python side, the raw
+     * activation, Python's Q^T x, and the float64 reference product. The C
+     * side must reproduce the rotation (regenerated signs + block tiling +
+     * FWHT) and then the matmul, or every rotated container decodes wrong. */
+    const uint8_t *sec = (const uint8_t *)(yref + O);
+    if ((size_t)(sec - raw) < nbytes) {
+        int32_t O2, I2;
+        memcpy(&O2, sec, 4); memcpy(&I2, sec + 4, 4);
+        size_t rb2 = (size_t)e8_rowbytes(I2);
+        const uint8_t *packed2 = sec + 8;
+        const float *x2    = (const float *)(packed2 + (size_t)O2 * rb2);
+        const float *xrot2 = x2 + I2;
+        const float *y2ref = xrot2 + I2;
+        float *xr = malloc((size_t)I2 * sizeof(float));
+        memcpy(xr, x2, (size_t)I2 * sizeof(float));
+        e8_rot_rows(xr, 1, I2);
+        double wrot = 0;
+        for (int i = 0; i < I2; i++) {
+            double d = fabs((double)xr[i] - (double)xrot2[i]);
+            double rel = d / (fabs((double)xrot2[i]) + 1e-6);
+            if (rel > wrot) wrot = rel;
+        }
+        float *y2 = malloc((size_t)O2 * sizeof(float));
+        matmul_e8(y2, xr, packed2, NULL, 1, I2, O2);
+        double wmm = 0;
+        for (int o = 0; o < O2; o++) {
+            double d = fabs((double)y2[o] - (double)y2ref[o]);
+            double rel = d / (fabs((double)y2ref[o]) + 1e-6);
+            if (rel > wmm) wmm = rel;
+        }
+        printf("e8 rotation oracle: O2=%d I2=%d, rot worst rel %.2e, matmul worst rel %.2e\n",
+               O2, I2, wrot, wmm);
+        if (wrot > 1e-5 || wmm > 1e-5) { printf("FAIL\n"); return 1; }
+        free(xr); free(y2);
+    } else {
+        fprintf(stderr, "fixture has no rotated section — regenerate with tools/make_e8_fixture.py\n");
+        return 1;
+    }
     printf("OK\n");
     free(y); free(raw);
     return 0;

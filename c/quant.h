@@ -1156,6 +1156,35 @@ static inline void e8_fwht(float *a, int n, const uint8_t *signbits){
 }
 static inline int e8_pow2_ceil(int n){ int p=1; while(p<n) p<<=1; return p; }
 
+/* Rotation sign bits, regenerated — not stored. xorshift64* seeded 417+n, one
+ * bit per element; tools/iq3_pack.py signs() draws the identical stream, so the
+ * container carries no rotation data and the two sides cannot drift apart
+ * without the oracle fixture catching it (#452). */
+static inline void e8_signs(uint8_t *bits, int n){
+    uint64_t s=417u+(uint64_t)n;
+    for(int i=0;i<(n+7)/8;i++){
+        s^=s>>12; s^=s<<25; s^=s>>27;
+        bits[i]=(uint8_t)((s*2685821657736338717ULL)>>56);
+    }
+}
+/* Apply the fmt=6 activation rotation Q^T in place, row-major [nr,dim].
+ * Non-power-of-two dims tile block-diagonally; each block is the largest power
+ * of two dividing the remainder (= its lowest set bit): 6144 -> 2048+4096,
+ * 1536 -> 512+1024. Blocks over 32768 halve until they fit the sign buffer.
+ * The converter rotates weight rows with this exact routine (W@Q and Q^T x are
+ * the same transform: Q is symmetric-orthogonal up to the sign flip). */
+static inline void e8_rot_rows(float *rows, int nr, int dim){
+    int off=0;
+    while(off<dim){
+        int rem=dim-off, b=rem&(-rem);
+        while(b>32768) b>>=1;
+        uint8_t bits[32768/8];
+        e8_signs(bits,b);
+        for(int r=0;r<nr;r++) e8_fwht(rows+(int64_t)r*dim+off,b,bits);
+        off+=b;
+    }
+}
+
 static void matmul_e8(float *y, const float *x, const uint8_t *q, const float *unused,
                       int S, int I, int O){
     (void)unused;                                  /* scales live inside the blocks */
