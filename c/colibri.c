@@ -571,8 +571,19 @@ static int g_prefetch=0; /* PREFETCH=1 -> riabilita il WILLNEED cross-layer (met
 static int g_direct=0;   /* DIRECT=1 -> O_DIRECT sugli slab expert. Default OFF: su questo host
                           * (VHDX su NVMe DRAM-less, latenza serializzata ~60ms/req) il buffered
                           * liscio e' risultato il migliore; su NVMe veri DIRECT=1 rende di piu'. */
-static float g_temp=-1;  /* TEMP: temperatura di sampling sui TOKEN. <0 = auto (1.0 in chat/testo,
-                          * 0=greedy in validazione). 0 = greedy puro. */
+static float g_temp=-1;  /* COLI_TEMP: temperatura di sampling sui TOKEN. <0 = auto (1.0 in chat/
+                          * testo, 0=greedy in validazione). 0 = greedy puro. */
+
+/* #509: COLI_TEMP e' il canale primario; TEMP resta come alias legacy ma SOLO se
+ * interamente numerica. $TEMP e' la directory temporanea per ROCm (comgr/MIOpen) e
+ * per Windows: un valore tipo 0.6 fa fallire l'init HIP, e sulle build native
+ * Windows atof("C:\...\Temp")==0 avrebbe silenziosamente forzato greedy sempre. */
+static float temp_from_env(const char *coli_temp, const char *temp){
+    if(coli_temp) return (float)atof(coli_temp);
+    if(temp && *temp){ char *tend; double tv=strtod(temp,&tend);
+                       if(tend!=temp && *tend=='\0') return (float)tv; }
+    return -1.f;
+}
 static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (default dal generation_config GLM-5.2) */
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
@@ -6449,7 +6460,7 @@ int main(int argc, char **argv){
      * getenv was missing, so the knob did nothing. I4S=<n> -> int4 IDOT only for S>=n. */
     if(getenv("I4S")) g_i4s=atoi(getenv("I4S"));
     if(getenv("XEXP")) g_xexp=atoi(getenv("XEXP"))!=0;
-    g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
+    g_temp = temp_from_env(getenv("COLI_TEMP"),getenv("TEMP")); /* -1 = auto (1.0 chat/testo, greedy altrove) */
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;  /* piu' stretto dell'ufficiale 0.95: la coda int4 e' rumore */
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
     else { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); g_rng ^= (uint64_t)ts.tv_nsec<<20 ^ (uint64_t)getpid(); }

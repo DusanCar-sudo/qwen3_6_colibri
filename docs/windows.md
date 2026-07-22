@@ -31,7 +31,7 @@ Use the container recommended in the README (with **int8 MTP heads** — int4 he
 From a normal PowerShell, in the repo's `c\` directory:
 
 ```powershell
-make glm.exe ARCH=native      # ARCH=native unlocks AVX-VNNI on Alder Lake+/Arrow Lake
+make colibri.exe ARCH=native      # ARCH=native unlocks AVX-VNNI on Alder Lake+/Arrow Lake
 make iobench.exe              # disk benchmark, useful before committing to the download
 ```
 
@@ -39,10 +39,10 @@ Warnings about `#pragma comment` and unused variables are normal (MSVC-isms gcc 
 
 ### ⚠️ Smart App Control will block your fresh binary
 
-On Windows 11 machines with **Smart App Control** enforced (`VerifiedAndReputablePolicyState = 1`), running your self-compiled `glm.exe` fails with:
+On Windows 11 machines with **Smart App Control** enforced (`VerifiedAndReputablePolicyState = 1`), running your self-compiled `colibri.exe` fails with:
 
 ```
-Program 'glm.exe' failed to run: An Application Control policy has blocked this file
+Program 'colibri.exe' failed to run: An Application Control policy has blocked this file
 ```
 
 This is not Defender and not Mark-of-the-Web — SAC blocks *all* unsigned, unknown binaries, which includes anything you compile yourself. **Fix:** Windows Security → App & browser control → Smart App Control settings → **Off**, then **reboot** (the policy only reloads on restart). Note SAC is one-way: re-enabling later requires resetting Windows. If the settings page is missing, the registry equivalent is setting `HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy\VerifiedAndReputablePolicyState` to `0` (admin PowerShell), then rebooting. Check your current state before touching anything:
@@ -64,13 +64,13 @@ nvcc needs MSVC as host compiler, so this one step must run from a shell with th
 
 ```cmd
 make cuda-dll CUDA_ARCH=sm_120        # match your GPU: sm_120 Blackwell, sm_89 Ada, ...
-make glm.exe CUDA_DLL=1 ARCH=native   # relink host with the runtime loader
+make colibri.exe CUDA_DLL=1 ARCH=native   # relink host with the runtime loader
 ```
 
 Two pitfalls, both fixed on current `dev` (#314) but worth knowing on older checkouts:
 
 - **Spaces in `CUDA_HOME`** (`C:\Program Files\...`) used to break the recipe → fixed; nvcc now comes from PATH and `"$(NVCC)"` is quoted.
-- **`make glm.exe CUDA_DLL=1` after a CPU-only build** used to report `up to date` and silently keep the CPU-only binary (GPU tier never engages, no error). Current `dev` has a build-config stamp that forces the relink. On older trees: delete `glm.exe` first.
+- **`make colibri.exe CUDA_DLL=1` after a CPU-only build** used to report `up to date` and silently keep the CPU-only binary (GPU tier never engages, no error). Current `dev` has a build-config stamp that forces the relink. On older trees: delete the binary (`colibri.exe`; `glm.exe` pre-rename) first.
 
 Sanity check: first GPU run should print `[CUDA] device 0: <your GPU>, ... sm_XX` and `[CUDA] mode: routed experts + resident dense tensors`.
 
@@ -99,10 +99,10 @@ Size `CUDA_EXPERT_GB` so dense (~10 GB) + experts + working set stays under your
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `'printf' is not recognized` / `The system cannot find the path specified` during `make glm.exe` | scoop MinGW has no `sh.exe`; make fell back to cmd.exe (#478) | §0 — use MSYS2/w64devkit, or `set PATH=%PATH%;C:\msys64\usr\bin` |
+| `'printf' is not recognized` / `The system cannot find the path specified` during `make colibri.exe` | scoop MinGW has no `sh.exe`; make fell back to cmd.exe (#478) | §0 — use MSYS2/w64devkit, or `set PATH=%PATH%;C:\msys64\usr\bin` |
 | `An Application Control policy has blocked this file` | Smart App Control | §2 — turn SAC off + **reboot** |
 | `cuda-dll ... Error 1` immediately | old tree: spaced CUDA_HOME / MSVC rejects `-Wextra` | update to current `dev` (#314) |
-| `glm.exe is up to date` but GPU never engages | old tree: stale CPU-only binary | update to `dev`, or delete `glm.exe` and rebuild |
+| `colibri.exe is up to date` but GPU never engages | old tree: stale CPU-only binary | update to `dev`, or delete the binary and rebuild |
 | `cl.exe (MSVC) not in PATH` | built from plain PowerShell | use the x64 Native Tools prompt |
 | `nvcc fatal: unsupported gpu architecture 'sm_120'` | CUDA < 12.8 | install CUDA 12.8+ |
 | MTP `0% (0/0)` on CPU path | int4 MTP heads in the container | use the int8-MTP container |
@@ -116,15 +116,15 @@ Size `CUDA_EXPERT_GB` so dense (~10 GB) + experts + working set stays under your
 # dot-product instruction (VPDPBUSD) the engine can use for ~1.3x faster
 # quantized matmul. The x86-64-v3 default (portable AVX2) compiles it out;
 # build for THIS machine to enable it:
-make glm.exe ARCH=native                       # banner prints "idot: avx-vnni"
+make colibri.exe ARCH=native                       # banner prints "idot: avx-vnni"
 
 # Verify (tiny model, 2.4 MB):
 pip install torch transformers safetensors huggingface_hub
 python tools/make_glm_oracle.py                # generate tiny oracle
-SNAP=./glm_tiny TF=1 ./glm.exe 64 16 16        # expect "32/32 positions"
+SNAP=./glm_tiny TF=1 ./colibri.exe 64 16 16        # expect "32/32 positions"
 
 # Run with real model:
-SNAP=D:\glm52_i4 ./glm.exe 64 4 16            # batch inference
+SNAP=D:\glm52_i4 ./colibri.exe 64 4 16            # batch inference
 python coli chat --model D:\glm52_i4            # interactive chat
 python coli serve --model D:\glm52_i4            # OpenAI-compatible API
 ```
@@ -149,7 +149,7 @@ completion.
 
 On Windows the engine is built with MinGW gcc but CUDA kernels require MSVC +
 nvcc. The split is clean: build the CUDA backend into a standalone
-`coli_cuda.dll` (nvcc + MSVC), then the host `glm.exe` loads it at runtime via
+`coli_cuda.dll` (nvcc + MSVC), then the host `colibri.exe` loads it at runtime via
 `LoadLibrary` (`c/backend_loader.c`). The host never links cudart directly; if
 the DLL is absent the engine falls back to CPU without error.
 
@@ -161,7 +161,7 @@ make cuda-dll CUDA_HOME="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.
 
 # Build the host with the runtime loader (CUDA_DLL=1 adds -DCOLI_CUDA and
 # links backend_loader.o instead of cudart):
-make glm.exe CUDA_DLL=1 ARCH=native
+make colibri.exe CUDA_DLL=1 ARCH=native
 
 # Run with the GPU expert tier (8 GB VRAM budget here; scale to your free VRAM):
 $env:COLI_CUDA="1"; $env:COLI_GPU="0"; $env:CUDA_EXPERT_GB="8"

@@ -206,10 +206,10 @@ scale-granularity/rotation ablations live in
 > through install → build → model → first chat step by step for Linux, Windows,
 > and macOS. On **Windows** you don't even need to build: download the
 > `colibri-<version>-windows-x86_64.zip` from
-> [Releases](https://github.com/JustVugg/colibri/releases), unzip it, rename
-> `colibri-*-windows-x86_64.exe` → `glm.exe`, install
-> [Python 3](https://www.python.org/downloads/), and run `coli chat` — full
-> details in the [Windows section](docs/quickstart.md#windows).
+> [Releases](https://github.com/JustVugg/colibri/releases), unzip it, install
+> [Python 3](https://www.python.org/downloads/), and run `coli chat` — the
+> engine ships ready to run as `colibri.exe`, the launcher finds it by itself.
+> Full details in the [Windows section](docs/quickstart.md#windows).
 
 ### 1. Get the model
 
@@ -245,10 +245,10 @@ and the optional API gateway.
 
 **On Windows?** You don't need to build. Download the
 `colibri-<version>-windows-x86_64.zip` from
-[Releases](https://github.com/JustVugg/colibri/releases), unzip it, rename
-`colibri-*-windows-x86_64.exe` → `glm.exe` (so the `coli` launcher finds the
-engine), install [Python 3](https://www.python.org/downloads/), then run
-`coli chat`. Full walkthrough in the [Quick Start guide](docs/quickstart.md#windows).
+[Releases](https://github.com/JustVugg/colibri/releases), unzip it, install
+[Python 3](https://www.python.org/downloads/), then run `coli chat` — the
+engine is already named `colibri.exe` and the launcher finds it next to
+itself. Full walkthrough in the [Quick Start guide](docs/quickstart.md#windows).
 
 Prefer a `coli` command on your PATH? From a checkout, `pip install -e .`
 registers it (the engine itself still lives in `c/` — this is an editable

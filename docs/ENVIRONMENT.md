@@ -19,7 +19,7 @@ Format: `VAR` — default — effect.
 | `RAM_GB` | `0` (auto ≈ 88% of free RAM) | RAM budget in GB for the resident/streamed expert working set. Higher → more experts stay hot → higher cache hit rate. |
 | `CTX` | `4096` | Maximum context length (tokens) the KV cache is sized for. |
 | `NGEN` | `256` (engine) | Max tokens to generate before stopping (stop tokens can end sooner). `coli --ngen` defaults to `1024`. |
-| `TEMP` | `-1` (auto: `1.0` for chat/text, greedy elsewhere) | Sampling temperature. **`TEMP=0` = greedy/argmax = deterministic.** |
+| `COLI_TEMP` | `-1` (auto: `1.0` for chat/text, greedy elsewhere) | Sampling temperature. **`COLI_TEMP=0` = greedy/argmax = deterministic.** `TEMP` still works as a deprecated alias, but only if fully numeric: `$TEMP` is the temp-*directory* path on Windows and for the ROCm runtime (#509), so prefer `COLI_TEMP`. |
 | `NUCLEUS` | `0.90` | Nucleus (top-p) mass kept when sampling. Slightly tighter than the official 0.95 because the int4 tail is noisy. |
 | `TOPK` | `0` (off) | Top-k filter on the sampling distribution (`0` = no limit). |
 | `TOPP` | `0` (off) | Top-p filter (`0` = use `NUCLEUS`). |
@@ -201,6 +201,6 @@ COLI_METAL=1 DIRECT=1 COLI_NO_OMP_TUNE=1 PIPE=1 PIPE_WORKERS=6 MTP=0 \
   ./coli run --model /path/to/model --ram 113 "your prompt"
 
 # same, but reproducible (greedy):
-TEMP=0 COLI_METAL=1 DIRECT=1 COLI_NO_OMP_TUNE=1 PIPE=1 PIPE_WORKERS=6 MTP=0 \
+COLI_TEMP=0 COLI_METAL=1 DIRECT=1 COLI_NO_OMP_TUNE=1 PIPE=1 PIPE_WORKERS=6 MTP=0 \
   ./coli run --model /path/to/model --ram 113 "your prompt"
 ```

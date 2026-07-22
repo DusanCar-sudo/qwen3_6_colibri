@@ -48,23 +48,17 @@ Inside you'll find:
 
 | File | What it is |
 |---|---|
-| `colibri-<version>-windows-x86_64.exe` | **the engine** — the C program that actually runs the model |
+| `colibri.exe` | **the engine** — the C program that actually runs the model |
 | `coli` | the command-line launcher (`chat`, `serve`, `convert`, `doctor`, …) |
 | `openai_server.py`, `resource_plan.py`, `doctor.py` | Python support for the API server and placement planner |
 
-Two setup steps:
-
-1. **Rename the engine to `glm.exe`** so the launcher can find it (it looks for a
-   binary named `glm`):
-   ```powershell
-   Rename-Item colibri-*-windows-x86_64.exe glm.exe
-   ```
-2. **Install Python 3** from [python.org](https://www.python.org/downloads/) — the
-   `coli` launcher and the API gateway are Python scripts (the engine itself is
-   pure C and needs nothing).
+One setup step: **install Python 3** from
+[python.org](https://www.python.org/downloads/) — the `coli` launcher and the
+API gateway are Python scripts (the engine itself is pure C and needs nothing).
+No renaming, no configuration: the launcher finds `colibri.exe` next to itself.
 
 Then continue to [step 3](#3-get-the-model). Prefer to skip the launcher? You can
-run the engine directly — `.\glm.exe` reads the model path from the `SNAP`
+run the engine directly — `.\colibri.exe` reads the model path from the `SNAP`
 environment variable (see [docs/windows.md](windows.md)) — but `coli chat` is the
 easy path.
 

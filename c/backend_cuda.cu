@@ -7,6 +7,10 @@
 #include <cstring>
 #include <mutex>
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+#include <sys/stat.h>
+#endif
+
 struct RaggedKVEntry {
     const void *key;
     const float *host_l,*host_r;
@@ -482,6 +486,19 @@ static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
 }
 
 extern "C" int coli_cuda_init(const int *devices, int count) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+    /* #509: the ROCm runtime (comgr, MIOpen, roctracer) reads $TEMP as a temp-dir
+     * path. A stray numeric TEMP (the engine's legacy sampling alias) makes comgr's
+     * lazy init fail inside the first stream create -- SIGSEGV in the error-unwind
+     * on gfx1100, clean hipErrorOutOfMemory on gfx1030. The engine has already
+     * parsed g_temp by the time we get here, so a TEMP that is not a real directory
+     * is safe to drop before the first ROCm call; a genuine temp-dir is preserved. */
+    {
+        const char *t = std::getenv("TEMP");
+        struct stat st;
+        if (t && *t && (stat(t, &st) != 0 || !S_ISDIR(st.st_mode))) unsetenv("TEMP");
+    }
+#endif
     int available = 0;
     if (!devices || count < 1 || count > COLI_CUDA_MAX_DEVICES) return 0;
     if (!cuda_ok(cudaGetDeviceCount(&available), "device discovery")) return 0;
