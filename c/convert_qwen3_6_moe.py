@@ -215,7 +215,70 @@ def convert_model(model_dir: Path, out_dir: Path, ebits: int = 8):
             for tensor in reader.tensors:
                 state_dict[tensor.name] = tensor.data
 
-    print(f"Loaded total {len(state_dict)} tensors.")
+    # Convert Dense Backbone
+    backbone_path = out_dir / "qwen3_6_backbone.bin"
+    print(f"[Qwen3.6 Convert] Writing dense backbone to {backbone_path}...")
+
+    vocab_size = 248320
+    hidden_dim = 2048
+    n_layers = 40
+    shared_inter = 512
+    n_routed = 256
+
+    with open(backbone_path, "wb") as f_bb:
+        f_bb.write(struct.pack("<IIIIIIIII", 0x5157454E, 1, n_layers, hidden_dim, 512, shared_inter, n_routed, 8, vocab_size))
+
+        # Embeddings
+        embed = state_dict.get("model.language_model.embed_tokens.weight", None)
+        if embed is not None:
+            f_bb.write(embed.float().numpy().tobytes())
+        else:
+            f_bb.write(bytes([0] * (vocab_size * hidden_dim * 4)))
+
+        # Per-layer dense weights
+        for l in range(n_layers):
+            p = f"model.language_model.layers.{l}"
+            
+            in_norm = state_dict.get(f"{p}.input_layernorm.weight", torch.ones(hidden_dim)).float().numpy()
+            f_bb.write(in_norm.tobytes())
+
+            qkv = state_dict.get(f"{p}.linear_attn.in_proj_qkv.weight", torch.zeros(8192, hidden_dim)).float().numpy()
+            z = state_dict.get(f"{p}.linear_attn.in_proj_z.weight", torch.zeros(4096, hidden_dim)).float().numpy()
+            out = state_dict.get(f"{p}.linear_attn.out_proj.weight", torch.zeros(hidden_dim, 4096)).float().numpy()
+
+            q_w = qkv[:2048, :]
+            k_w = qkv[2048:4096, :]
+            v_w = qkv[4096:, :]
+
+            f_bb.write(q_w.tobytes())
+            f_bb.write(k_w.tobytes())
+            f_bb.write(v_w.tobytes())
+            f_bb.write(z.tobytes())
+            f_bb.write(torch.zeros(hidden_dim, hidden_dim).numpy().tobytes()) # beta dummy
+            f_bb.write(out.tobytes())
+
+            post_norm = state_dict.get(f"{p}.post_attention_layernorm.weight", torch.ones(hidden_dim)).float().numpy()
+            f_bb.write(post_norm.tobytes())
+
+            sh_g = state_dict.get(f"{p}.mlp.shared_expert.gate_proj.weight", torch.zeros(shared_inter, hidden_dim)).float().numpy()
+            sh_u = state_dict.get(f"{p}.mlp.shared_expert.up_proj.weight", torch.zeros(shared_inter, hidden_dim)).float().numpy()
+            sh_d = state_dict.get(f"{p}.mlp.shared_expert.down_proj.weight", torch.zeros(hidden_dim, shared_inter)).float().numpy()
+            f_bb.write(sh_g.tobytes())
+            f_bb.write(sh_u.tobytes())
+            f_bb.write(sh_d.tobytes())
+
+            r_w = state_dict.get(f"{p}.mlp.gate.weight", torch.zeros(n_routed, hidden_dim)).float().numpy()
+            r_b = torch.zeros(n_routed).numpy()
+            f_bb.write(r_w.tobytes())
+            f_bb.write(r_b.tobytes())
+
+        fn = state_dict.get("model.language_model.norm.weight", torch.ones(hidden_dim)).float().numpy()
+        f_bb.write(fn.tobytes())
+
+        lm = state_dict.get("model.language_model.embed_tokens.weight", torch.zeros(vocab_size, hidden_dim)).float().numpy()
+        f_bb.write(lm.tobytes())
+
+    print(f"Backbone converted successfully -> {backbone_path}")
 
     # Find number of layers
     layer_indices = set()
