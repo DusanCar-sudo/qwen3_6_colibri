@@ -16,7 +16,7 @@ extern "C" {
 /* Architecture constants for Qwen 3.6 35B MoE */
 #define QWEN3_6_HIDDEN_DIM          2048
 #define QWEN3_6_MOE_INTER_DIM       1408
-#define QWEN3_6_SHARED_INTER_DIM    1408
+#define QWEN3_6_SHARED_INTER_DIM    512
 #define QWEN3_6_N_ROUTED_EXPERTS    256
 #define QWEN3_6_N_SHARED_EXPERTS    1
 #define QWEN3_6_TOPK                8
