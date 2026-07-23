@@ -333,8 +333,24 @@ cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tens
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
-main_qwen3_6$(EXE): main_qwen3_6.c qwen3_6_moe.c qwen3_6_moe.h compat.h
-	$(CC) $(CFLAGS) main_qwen3_6.c qwen3_6_moe.c -o main_qwen3_6$(EXE) $(LDFLAGS)
+main_qwen3_6$(EXE): # --- AMD GPU (ROCm/HIP) Build Target ---
+HIP ?= 0
+OFFLOAD_ARCH ?= gfx1035
+
+ifeq ($(HIP),1)
+    HIPCC = hipcc
+    HIPFLAGS = -O3 --offload-arch=$(OFFLOAD_ARCH) -DCOLI_USE_GPU=1 -DHIP=1 -DCOLIBRI_BACKEND_GPU_COMPAT_H
+    CFLAGS += -DCOLI_USE_GPU=1 -DHIP=1
+    GPU_OBJ = backend_hip.o
+else
+    GPU_OBJ =
+endif
+
+backend_hip.o: backend_cuda.cu backend_gpu_compat.h
+	$(HIPCC) $(HIPFLAGS) -I. -c backend_cuda.cu -o backend_hip.o
+
+main_qwen3_6_gpu: main_qwen3_6.c qwen3_6_moe.c $(GPU_OBJ)
+	$(CC) $(CFLAGS) main_qwen3_6.c qwen3_6_moe.c $(GPU_OBJ) -o main_qwen3_6_gpu -lm $(OMPL) $(if $(filter 1,$(HIP)),-L/usr/lib/rocm/lib -lamdhip64) $(LDFLAGS)
 
 test_qwen3_6_moe$(EXE): test_qwen3_6_moe.c qwen3_6_moe.c qwen3_6_moe.h compat.h
 	$(CC) $(CFLAGS) test_qwen3_6_moe.c qwen3_6_moe.c -o test_qwen3_6_moe$(EXE) $(LDFLAGS)
