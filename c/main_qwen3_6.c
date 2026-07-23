@@ -55,15 +55,48 @@ static void load_vocab_bin(const char *vocab_path) {
 }
 
 static void encode_prompt(const char *prompt, int *tokens, int *n_tokens, int vocab_size) {
-    int len = (int)strlen(prompt);
     int count = 0;
-    for (int i = 0; i < len; i++) {
-        unsigned char c = (unsigned char)prompt[i];
-        tokens[count++] = (int)c % vocab_size;
+    tokens[count++] = 151644; // <|im_start|> user token
+
+    if (g_vocab.tokens && g_vocab.vocab_size > 0) {
+        int len = (int)strlen(prompt);
+        int pos = 0;
+        while (pos < len) {
+            int best_match_len = 0;
+            int best_token_id = -1;
+
+            // Simple greedy longest-prefix subword matching
+            for (int id = 0; id < g_vocab.vocab_size; id++) {
+                if (!g_vocab.tokens[id]) continue;
+                const char *vtok = g_vocab.tokens[id];
+                int vlen = (int)strlen(vtok);
+                if (vlen > 0 && vlen <= (len - pos)) {
+                    if (strncmp(prompt + pos, vtok, vlen) == 0) {
+                        if (vlen > best_match_len) {
+                            best_match_len = vlen;
+                            best_token_id = id;
+                        }
+                    }
+                }
+            }
+
+            if (best_token_id >= 0 && best_match_len > 0) {
+                tokens[count++] = best_token_id;
+                pos += best_match_len;
+            } else {
+                tokens[count++] = (unsigned char)prompt[pos];
+                pos++;
+            }
+            if (count >= 1000) break;
+        }
+    } else {
+        int len = (int)strlen(prompt);
+        for (int i = 0; i < len; i++) {
+            tokens[count++] = (unsigned char)prompt[i];
+        }
     }
-    if (count == 0) {
-        tokens[count++] = 1; /* BOS token */
-    }
+
+    tokens[count++] = 151645; // <|im_end|> token
     *n_tokens = count;
 }
 
