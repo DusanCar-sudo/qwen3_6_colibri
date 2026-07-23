@@ -56,7 +56,9 @@ static void load_vocab_bin(const char *vocab_path) {
 
 static void encode_prompt(const char *prompt, int *tokens, int *n_tokens, int vocab_size) {
     int count = 0;
-    tokens[count++] = 151644; // <|im_start|> user token
+    tokens[count++] = 151644; // <|im_start|>
+    tokens[count++] = 872;    // user
+    tokens[count++] = 198;    // \n
 
     if (g_vocab.tokens && g_vocab.vocab_size > 0) {
         int len = (int)strlen(prompt);
@@ -96,7 +98,11 @@ static void encode_prompt(const char *prompt, int *tokens, int *n_tokens, int vo
         }
     }
 
-    tokens[count++] = 151645; // <|im_end|> token
+    tokens[count++] = 151645; // <|im_end|>
+    tokens[count++] = 198;    // \n
+    tokens[count++] = 151644; // <|im_start|>
+    tokens[count++] = 77091;  // assistant
+    tokens[count++] = 198;    // \n
     *n_tokens = count;
 }
 
