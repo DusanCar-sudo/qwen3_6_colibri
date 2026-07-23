@@ -221,7 +221,7 @@ static void run_generation(Qwen3_6Model *model, const char *prompt, int max_toke
         print_token(next_token);
         generated_count++;
 
-        if (next_token == 0 || next_token == 151643) { /* EOS token */
+        if (next_token == 151643 || next_token == 151645) { /* EOS token */
             break;
         }
 
