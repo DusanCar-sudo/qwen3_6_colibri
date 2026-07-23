@@ -27,6 +27,33 @@ static double get_time_sec(void) {
 }
 
 /* Simple Byte / Tokenizer Helpers for Demo CLI */
+typedef struct {
+    char **tokens;
+    int vocab_size;
+} QwenVocab;
+
+static QwenVocab g_vocab = {NULL, 0};
+
+static void load_vocab_bin(const char *vocab_path) {
+    FILE *f = fopen(vocab_path, "rb");
+    if (!f) return;
+    uint32_t count = 0;
+    if (fread(&count, 4, 1, f) != 1) { fclose(f); return; }
+    g_vocab.vocab_size = (int)count;
+    g_vocab.tokens = (char**)calloc(count, sizeof(char*));
+    for (uint32_t i = 0; i < count; i++) {
+        uint16_t len = 0;
+        if (fread(&len, 2, 1, f) != 1) break;
+        g_vocab.tokens[i] = (char*)malloc(len + 1);
+        if (len > 0) {
+            if (fread(g_vocab.tokens[i], 1, len, f) != len) {}
+        }
+        g_vocab.tokens[i][len] = '\0';
+    }
+    fclose(f);
+    printf("[QwenVocab] Loaded %d real tokens from '%s'\n", g_vocab.vocab_size, vocab_path);
+}
+
 static void encode_prompt(const char *prompt, int *tokens, int *n_tokens, int vocab_size) {
     int len = (int)strlen(prompt);
     int count = 0;
@@ -41,14 +68,26 @@ static void encode_prompt(const char *prompt, int *tokens, int *n_tokens, int vo
 }
 
 static void print_token(int token_id) {
-    if (token_id >= 32 && token_id <= 126) {
+    if (g_vocab.tokens && token_id >= 0 && token_id < g_vocab.vocab_size && g_vocab.tokens[token_id]) {
+        const char *t = g_vocab.tokens[token_id];
+        // Handle Byte-Pair Encoding space markers (e.g. Ġ / Ċ)
+        for (int i = 0; t[i] != '\0'; i++) {
+            if ((unsigned char)t[i] == 0xc4 && (unsigned char)t[i+1] == 0xa0) { // Ġ
+                printf(" ");
+                i++;
+            } else if ((unsigned char)t[i] == 0xc4 && (unsigned char)t[i+1] == 0x8a) { // Ċ
+                printf("\n");
+                i++;
+            } else {
+                putchar(t[i]);
+            }
+        }
+    } else if (token_id >= 32 && token_id <= 126) {
         printf("%c", (char)token_id);
     } else if (token_id == 10 || token_id == 13) {
         printf("\n");
     } else {
-        /* Pseudo-word map for non-printable synthetic tokens */
-        const char *words[] = {" the", " Qwen", " MoE", " model", " system", " fast", " streaming", " layer", " expert", " active"};
-        printf("%s", words[token_id % 10]);
+        printf(" ");
     }
     fflush(stdout);
 }
@@ -219,6 +258,7 @@ int main(int argc, char **argv) {
 
     const char *backbone_path = "qwen3_6_backbone.bin";
     const char *experts_path = "qwen3_6_experts.shard";
+    const char *vocab_path = "qwen3_6_vocab.bin";
     const char *prompt = NULL;
     bool interactive = false;
     float temp = 0.7f;
@@ -233,6 +273,8 @@ int main(int argc, char **argv) {
             backbone_path = argv[++i];
         } else if (strcmp(argv[i], "--experts") == 0 && i + 1 < argc) {
             experts_path = argv[++i];
+        } else if (strcmp(argv[i], "--vocab-bin") == 0 && i + 1 < argc) {
+            vocab_path = argv[++i];
         } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
             prompt = argv[++i];
         } else if (strcmp(argv[i], "--chat") == 0 || strcmp(argv[i], "-i") == 0) {
@@ -268,6 +310,8 @@ int main(int argc, char **argv) {
     printf(" Cache Capacity: %d experts / layer\n", cache_cap);
     printf(" Temperature   : %.2f | Top-P: %.2f\n", temp, top_p);
     printf("=====================================================\n\n");
+
+    load_vocab_bin(vocab_path);
 
     ensure_dummy_files_exist(backbone_path, experts_path, n_layers, vocab_size);
 

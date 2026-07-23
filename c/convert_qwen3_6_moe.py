@@ -233,16 +233,20 @@ def convert_model(model_dir: Path, out_dir: Path, ebits: int = 8):
     
     with open(experts_path, "wb") as f_exp:
         for l in range(n_layers):
-            for e in range(N_ROUTED_EXPERTS):
-                # Expert key patterns
-                g_key = f"model.layers.{l}.mlp.experts.{e}.gate_proj.weight"
-                u_key = f"model.layers.{l}.mlp.experts.{e}.up_proj.weight"
-                d_key = f"model.layers.{l}.mlp.experts.{e}.down_proj.weight"
+            # Check fused expert tensors
+            fused_gu_key = f"model.language_model.layers.{l}.mlp.experts.gate_up_proj"
+            fused_d_key = f"model.language_model.layers.{l}.mlp.experts.down_proj"
+            
+            gu_tensor = state_dict.get(fused_gu_key, None)
+            d_tensor = state_dict.get(fused_d_key, None)
 
-                if g_key in state_dict and u_key in state_dict and d_key in state_dict:
-                    gate_w = state_dict[g_key]
-                    up_w = state_dict[u_key]
-                    down_w = state_dict[d_key]
+            for e in range(N_ROUTED_EXPERTS):
+                if gu_tensor is not None and d_tensor is not None:
+                    # gu_tensor shape: [256, 1024, 2048] -> split into gate (512) and up (512)
+                    exp_gu = gu_tensor[e] # [1024, 2048]
+                    gate_w = exp_gu[:512, :]
+                    up_w = exp_gu[512:, :]
+                    down_w = d_tensor[e] # [2048, 512]
 
                     g_bytes, g_scales = quantize_row_int8(gate_w)
                     u_bytes, u_scales = quantize_row_int8(up_w)
@@ -255,20 +259,37 @@ def convert_model(model_dir: Path, out_dir: Path, ebits: int = 8):
                     f_exp.write(u_scales)
                     f_exp.write(d_scales)
                 else:
-                    # Synthetic fallback for missing expert in layer
-                    g_bytes = bytes([0] * (MOE_INTER_DIM * HIDDEN_DIM))
-                    u_bytes = bytes([0] * (MOE_INTER_DIM * HIDDEN_DIM))
-                    d_bytes = bytes([0] * (HIDDEN_DIM * MOE_INTER_DIM))
-                    scales_g = struct.pack(f"<{MOE_INTER_DIM}f", *[1.0]*MOE_INTER_DIM)
-                    scales_u = struct.pack(f"<{MOE_INTER_DIM}f", *[1.0]*MOE_INTER_DIM)
-                    scales_d = struct.pack(f"<{HIDDEN_DIM}f", *[1.0]*HIDDEN_DIM)
+                    # Unfused key fallback
+                    g_key = f"model.language_model.layers.{l}.mlp.experts.{e}.gate_proj.weight"
+                    u_key = f"model.language_model.layers.{l}.mlp.experts.{e}.up_proj.weight"
+                    d_key = f"model.language_model.layers.{l}.mlp.experts.{e}.down_proj.weight"
 
-                    f_exp.write(g_bytes)
-                    f_exp.write(u_bytes)
-                    f_exp.write(d_bytes)
-                    f_exp.write(scales_g)
-                    f_exp.write(scales_u)
-                    f_exp.write(scales_d)
+                    if g_key in state_dict and u_key in state_dict and d_key in state_dict:
+                        g_bytes, g_scales = quantize_row_int8(state_dict[g_key])
+                        u_bytes, u_scales = quantize_row_int8(state_dict[u_key])
+                        d_bytes, d_scales = quantize_row_int8(state_dict[d_key])
+
+                        f_exp.write(g_bytes)
+                        f_exp.write(u_bytes)
+                        f_exp.write(d_bytes)
+                        f_exp.write(g_scales)
+                        f_exp.write(u_scales)
+                        f_exp.write(d_scales)
+                    else:
+                        # Fallback for empty slots
+                        g_bytes = bytes([0] * (MOE_INTER_DIM * HIDDEN_DIM))
+                        u_bytes = bytes([0] * (MOE_INTER_DIM * HIDDEN_DIM))
+                        d_bytes = bytes([0] * (HIDDEN_DIM * MOE_INTER_DIM))
+                        scales_g = struct.pack(f"<{MOE_INTER_DIM}f", *[1.0]*MOE_INTER_DIM)
+                        scales_u = struct.pack(f"<{MOE_INTER_DIM}f", *[1.0]*MOE_INTER_DIM)
+                        scales_d = struct.pack(f"<{HIDDEN_DIM}f", *[1.0]*HIDDEN_DIM)
+
+                        f_exp.write(g_bytes)
+                        f_exp.write(u_bytes)
+                        f_exp.write(d_bytes)
+                        f_exp.write(scales_g)
+                        f_exp.write(scales_u)
+                        f_exp.write(scales_d)
 
     print(f"Expert shards converted successfully -> {experts_path}")
 
