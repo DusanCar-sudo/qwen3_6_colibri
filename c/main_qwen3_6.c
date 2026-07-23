@@ -296,8 +296,8 @@ int main(int argc, char **argv) {
     float top_p = 0.9f;
     int max_tokens = 128;
     int cache_cap = 32;
-    int n_layers = 4;
-    int vocab_size = 1000;
+    int n_layers = 40;
+    int vocab_size = 248320;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--backbone") == 0 && i + 1 < argc) {
