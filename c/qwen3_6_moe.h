@@ -90,7 +90,8 @@ typedef struct {
     QwenQT k_proj;
     QwenQT v_proj;
     QwenQT g_proj;      /* Output gate projection */
-    QwenQT beta_proj;   /* DeltaNet update gate beta */
+    QwenQT a_proj;      /* Dynamic beta projection (32 x hidden_dim) */
+    float *dt_bias;     /* Head-wise dt bias [32] */
     QwenQT out_proj;    /* Final output projection */
 } QwenGatedDeltaNet;
 

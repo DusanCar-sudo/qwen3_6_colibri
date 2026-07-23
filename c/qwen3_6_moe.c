@@ -369,15 +369,18 @@ int qwen_deltanet_init(QwenGatedDeltaNet *dn, int hidden, int num_heads, int hea
 
     size_t state_elems = (size_t)num_heads * head_dim * head_dim;
     dn->state_matrix = (float*)calloc(state_elems, sizeof(float));
-    if (!dn->state_matrix) return -1;
+    dn->dt_bias = (float*)calloc(32, sizeof(float));
+    if (!dn->state_matrix || !dn->dt_bias) return -1;
 
     return 0;
 }
 
 void qwen_deltanet_free(QwenGatedDeltaNet *dn) {
-    if (dn && dn->state_matrix) {
-        free(dn->state_matrix);
+    if (dn) {
+        if (dn->state_matrix) free(dn->state_matrix);
+        if (dn->dt_bias) free(dn->dt_bias);
         dn->state_matrix = NULL;
+        dn->dt_bias = NULL;
     }
 }
 
@@ -385,12 +388,12 @@ void qwen_deltanet_forward(QwenGatedDeltaNet *dn, const float *x, float *out) {
     int NH = dn->num_heads;
     int HD = dn->head_dim;
 
-    float q[2048], k[2048], v[4096], g[4096], beta[2048];
+    float q[2048], k[2048], v[4096], g[4096], a[32];
     qwen_matmul_qt(x, &dn->q_proj, q, 1);
     qwen_matmul_qt(x, &dn->k_proj, k, 1);
     qwen_matmul_qt(x, &dn->v_proj, v, 1);
     qwen_matmul_qt(x, &dn->g_proj, g, 1);
-    qwen_matmul_qt(x, &dn->beta_proj, beta, 1);
+    qwen_matmul_qt(x, &dn->a_proj, a, 1);
 
     float attn_out[4096];
 
@@ -398,7 +401,7 @@ void qwen_deltanet_forward(QwenGatedDeltaNet *dn, const float *x, float *out) {
         const float *qh = q + h * HD;
         const float *kh = k + h * HD;
         const float *vh = v + h * (HD * 2);
-        float b_val = sigmoid(beta[h * HD]);
+        float b_val = sigmoid(a[h] + dn->dt_bias[h]);
         float *S_h = dn->state_matrix + h * HD * HD;
 
         /* DeltaNet Recurrence State Update: S_t = (1 - beta) * S_{t-1} + beta * (v * k^T) */
@@ -631,7 +634,7 @@ int qwen_model_load_backbone(Qwen3_6Model *model, const char *backbone_path) {
         float *buf_k = (float*)malloc(h_d * h_d * sizeof(float));
         float *buf_v = (float*)malloc(4096 * h_d * sizeof(float));
         float *buf_g = (float*)malloc(4096 * h_d * sizeof(float));
-        float *buf_beta = (float*)malloc(h_d * h_d * sizeof(float));
+        float *buf_a = (float*)malloc(32 * h_d * sizeof(float));
         float *buf_out = (float*)malloc(h_d * 4096 * sizeof(float));
 
         size_t nread = 0;
@@ -639,14 +642,15 @@ int qwen_model_load_backbone(Qwen3_6Model *model, const char *backbone_path) {
         nread += fread(buf_k, sizeof(float), h_d * h_d, f);
         nread += fread(buf_v, sizeof(float), 4096 * h_d, f);
         nread += fread(buf_g, sizeof(float), 4096 * h_d, f);
-        nread += fread(buf_beta, sizeof(float), h_d * h_d, f);
+        nread += fread(buf_a, sizeof(float), 32 * h_d, f);
+        nread += fread(layer->deltanet.dt_bias, sizeof(float), 32, f);
         nread += fread(buf_out, sizeof(float), h_d * 4096, f);
 
         qwen_qt_init_f32(&layer->deltanet.q_proj, h_d, h_d, buf_q);
         qwen_qt_init_f32(&layer->deltanet.k_proj, h_d, h_d, buf_k);
         qwen_qt_init_f32(&layer->deltanet.v_proj, 4096, h_d, buf_v);
         qwen_qt_init_f32(&layer->deltanet.g_proj, 4096, h_d, buf_g);
-        qwen_qt_init_f32(&layer->deltanet.beta_proj, h_d, h_d, buf_beta);
+        qwen_qt_init_f32(&layer->deltanet.a_proj, 32, h_d, buf_a);
         qwen_qt_init_f32(&layer->deltanet.out_proj, h_d, 4096, buf_out);
 
         nread += fread(layer->post_attn_layernorm, sizeof(float), h_d, f);
@@ -696,7 +700,7 @@ void qwen_model_free(Qwen3_6Model *model) {
             if (model->layers[l].deltanet.k_proj.qf) free(model->layers[l].deltanet.k_proj.qf);
             if (model->layers[l].deltanet.v_proj.qf) free(model->layers[l].deltanet.v_proj.qf);
             if (model->layers[l].deltanet.g_proj.qf) free(model->layers[l].deltanet.g_proj.qf);
-            if (model->layers[l].deltanet.beta_proj.qf) free(model->layers[l].deltanet.beta_proj.qf);
+            if (model->layers[l].deltanet.a_proj.qf) free(model->layers[l].deltanet.a_proj.qf);
             if (model->layers[l].deltanet.out_proj.qf) free(model->layers[l].deltanet.out_proj.qf);
             if (model->layers[l].sh_gate.qf) free(model->layers[l].sh_gate.qf);
             if (model->layers[l].sh_up.qf) free(model->layers[l].sh_up.qf);
