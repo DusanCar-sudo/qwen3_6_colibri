@@ -242,9 +242,18 @@ def convert_model(model_dir: Path, out_dir: Path, ebits: int = 8):
             in_norm = state_dict.get(f"{p}.input_layernorm.weight", torch.ones(hidden_dim)).float().numpy()
             f_bb.write(in_norm.tobytes())
 
-            qkv = state_dict.get(f"{p}.linear_attn.in_proj_qkv.weight", torch.zeros(8192, hidden_dim)).float().numpy()
+            qkv = state_dict.get(f"{p}.linear_attn.in_proj_qkv.weight", None)
+            if qkv is None:
+                qkv = state_dict.get(f"{p}.self_attn.in_proj_qkv.weight", torch.zeros(8192, hidden_dim)).float().numpy()
+            else:
+                qkv = qkv.float().numpy()
+
             z = state_dict.get(f"{p}.linear_attn.in_proj_z.weight", torch.zeros(4096, hidden_dim)).float().numpy()
-            out = state_dict.get(f"{p}.linear_attn.out_proj.weight", torch.zeros(hidden_dim, 4096)).float().numpy()
+            out = state_dict.get(f"{p}.linear_attn.out_proj.weight", None)
+            if out is None:
+                out = state_dict.get(f"{p}.self_attn.out_proj.weight", torch.zeros(hidden_dim, 4096)).float().numpy()
+            else:
+                out = out.float().numpy()
 
             q_w = qkv[:2048, :]
             k_w = qkv[2048:4096, :]
@@ -259,6 +268,11 @@ def convert_model(model_dir: Path, out_dir: Path, ebits: int = 8):
 
             post_norm = state_dict.get(f"{p}.post_attention_layernorm.weight", torch.ones(hidden_dim)).float().numpy()
             f_bb.write(post_norm.tobytes())
+
+            q_n = state_dict.get(f"{p}.self_attn.q_norm.weight", torch.ones(256)).float().numpy()
+            k_n = state_dict.get(f"{p}.self_attn.k_norm.weight", torch.ones(256)).float().numpy()
+            f_bb.write(q_n.tobytes())
+            f_bb.write(k_n.tobytes())
 
             sh_g = state_dict.get(f"{p}.mlp.shared_expert.gate_proj.weight", torch.zeros(shared_inter, hidden_dim)).float().numpy()
             sh_u = state_dict.get(f"{p}.mlp.shared_expert.up_proj.weight", torch.zeros(shared_inter, hidden_dim)).float().numpy()
@@ -275,8 +289,10 @@ def convert_model(model_dir: Path, out_dir: Path, ebits: int = 8):
         fn = state_dict.get("model.language_model.norm.weight", torch.ones(hidden_dim)).float().numpy()
         f_bb.write(fn.tobytes())
 
-        lm = state_dict.get("model.language_model.embed_tokens.weight", torch.zeros(vocab_size, hidden_dim)).float().numpy()
-        f_bb.write(lm.tobytes())
+        lm = state_dict.get("lm_head.weight", None)
+        if lm is None:
+            lm = state_dict.get("model.language_model.embed_tokens.weight", torch.zeros(vocab_size, hidden_dim))
+        f_bb.write(lm.float().numpy().tobytes())
 
     print(f"Backbone converted successfully -> {backbone_path}")
 

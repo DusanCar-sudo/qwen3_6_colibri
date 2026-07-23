@@ -438,9 +438,13 @@ int qwen_moe_layer_init(QwenMoELayer *layer, int layer_id, int hidden, int moe_i
     layer->moe_inter_dim = moe_inter;
     layer->n_routed_experts = n_experts;
     layer->topk = topk;
+    layer->is_full_attn = (layer_id == 11 || layer_id == 15 || layer_id == 19 || layer_id == 23 || 
+                           layer_id == 27 || layer_id == 31 || layer_id == 35 || layer_id == 39);
 
     layer->input_layernorm = (float*)malloc(hidden * sizeof(float));
     layer->post_attn_layernorm = (float*)malloc(hidden * sizeof(float));
+    layer->q_norm = (float*)calloc(256, sizeof(float));
+    layer->k_norm = (float*)calloc(256, sizeof(float));
     for (int i = 0; i < hidden; i++) {
         layer->input_layernorm[i] = 1.0f;
         layer->post_attn_layernorm[i] = 1.0f;
@@ -469,6 +473,8 @@ void qwen_moe_layer_free(QwenMoELayer *layer) {
     if (layer) {
         if (layer->input_layernorm) free(layer->input_layernorm);
         if (layer->post_attn_layernorm) free(layer->post_attn_layernorm);
+        if (layer->q_norm) free(layer->q_norm);
+        if (layer->k_norm) free(layer->k_norm);
         if (layer->router_weights) free(layer->router_weights);
         if (layer->router_bias) free(layer->router_bias);
 
@@ -636,6 +642,8 @@ int qwen_model_load_backbone(Qwen3_6Model *model, const char *backbone_path) {
         qwen_qt_init_f32(&layer->deltanet.out_proj, h_d, h_d, buf_out);
 
         nread += fread(layer->post_attn_layernorm, sizeof(float), h_d, f);
+        nread += fread(layer->q_norm, sizeof(float), 256, f);
+        nread += fread(layer->k_norm, sizeof(float), 256, f);
 
         float *buf_sg = (float*)malloc(s_i * h_d * sizeof(float));
         float *buf_su = (float*)malloc(s_i * h_d * sizeof(float));

@@ -101,10 +101,13 @@ typedef struct {
     int moe_inter_dim;
     int n_routed_experts;
     int topk;
-    
+    bool is_full_attn;         /* True for self_attn layers (11, 15, 19, 23, 27, 31, 35, 39) */
+
     /* LayerNorm weights */
     float *input_layernorm;
     float *post_attn_layernorm;
+    float *q_norm;             /* For self_attn layers */
+    float *k_norm;             /* For self_attn layers */
     
     /* Gated DeltaNet linear attention module */
     QwenGatedDeltaNet deltanet;
