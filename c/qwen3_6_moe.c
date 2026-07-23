@@ -720,8 +720,15 @@ void qwen_model_forward_token(Qwen3_6Model *model, int token_id, float *logits) 
         memcpy(x, x_next, H * sizeof(float));
     }
 
+    /* Final RMSNorm */
+    float ss = 0.0f;
     for (int i = 0; i < H; i++) {
-        x[i] *= model->final_norm[i];
+        ss += x[i] * x[i];
+    }
+    float rms = 1.0f / sqrtf(ss / H + 1e-6f);
+
+    for (int i = 0; i < H; i++) {
+        x[i] = (x[i] * rms) * model->final_norm[i];
     }
 
     for (int v = 0; v < V; v++) {
