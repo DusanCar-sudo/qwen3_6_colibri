@@ -104,21 +104,19 @@ static void print_token(int token_id) {
     if (g_vocab.tokens && token_id >= 0 && token_id < g_vocab.vocab_size && g_vocab.tokens[token_id]) {
         const char *t = g_vocab.tokens[token_id];
         for (int i = 0; t[i] != '\0'; i++) {
-            // Handle Tiktoken / BPE leading space marker \u0120 (0xc4 0xa0 in UTF-8)
+            // Handle BPE space marker \u0120 (0xc4 0xa0)
             if ((unsigned char)t[i] == 0xc4 && (unsigned char)t[i+1] == 0xa0) {
                 putchar(' ');
                 i++;
-            } else if ((unsigned char)t[i] == 0xc4 && (unsigned char)t[i+1] == 0x8a) { // \u010a (newline)
+            } else if ((unsigned char)t[i] == 0xc4 && (unsigned char)t[i+1] == 0x8a) {
                 putchar('\n');
                 i++;
             } else {
-                putchar(t[i]);
+                putchar((unsigned char)t[i]);
             }
         }
-    } else if (token_id >= 32 && token_id <= 126) {
-        putchar((char)token_id);
-    } else if (token_id == 10 || token_id == 13) {
-        putchar('\n');
+    } else {
+        printf("[%d]", token_id);
     }
     fflush(stdout);
 }

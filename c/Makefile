@@ -333,7 +333,8 @@ cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tens
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
-main_qwen3_6$(EXE): # --- AMD GPU (ROCm/HIP) Build Target ---
+main_qwen3_6$(EXE): main_qwen3_6.c qwen3_6_moe.c qwen3_6_moe.h compat.h
+	$(CC) $(CFLAGS) main_qwen3_6.c qwen3_6_moe.c -o main_qwen3_6$(EXE) $(LDFLAGS)
 HIP ?= 0
 OFFLOAD_ARCH ?= gfx1035
 
