@@ -487,10 +487,14 @@ void qwen_moe_layer_forward(QwenMoELayer *layer, const float *x_in, float *x_out
     int H = layer->hidden_dim;
     int topk = layer->topk;
 
-    /* 1. Input LayerNorm + Gated DeltaNet Linear Attention */
+    /* 1. Input RMSNorm + Gated DeltaNet Linear Attention */
+    float ss0 = 0.0f;
+    for (int i = 0; i < H; i++) ss0 += x_in[i] * x_in[i];
+    float rms0 = 1.0f / sqrtf(ss0 / H + 1e-6f);
+
     float norm_x[2048] = {0};
     for (int i = 0; i < H; i++) {
-        norm_x[i] = x_in[i] * layer->input_layernorm[i];
+        norm_x[i] = (x_in[i] * rms0) * layer->input_layernorm[i];
     }
 
     float attn_out[2048] = {0};
@@ -502,10 +506,14 @@ void qwen_moe_layer_forward(QwenMoELayer *layer, const float *x_in, float *x_out
         x1[i] = x_in[i] + attn_out[i];
     }
 
-    /* 2. Post-Attention LayerNorm */
+    /* 2. Post-Attention RMSNorm */
+    float ss1 = 0.0f;
+    for (int i = 0; i < H; i++) ss1 += x1[i] * x1[i];
+    float rms1 = 1.0f / sqrtf(ss1 / H + 1e-6f);
+
     float norm_x1[2048] = {0};
     for (int i = 0; i < H; i++) {
-        norm_x1[i] = x1[i] * layer->post_attn_layernorm[i];
+        norm_x1[i] = (x1[i] * rms1) * layer->post_attn_layernorm[i];
     }
 
     /* 3. Shared Expert Execution */
