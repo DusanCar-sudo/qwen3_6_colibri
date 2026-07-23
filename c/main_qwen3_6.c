@@ -70,24 +70,22 @@ static void encode_prompt(const char *prompt, int *tokens, int *n_tokens, int vo
 static void print_token(int token_id) {
     if (g_vocab.tokens && token_id >= 0 && token_id < g_vocab.vocab_size && g_vocab.tokens[token_id]) {
         const char *t = g_vocab.tokens[token_id];
-        // Handle Byte-Pair Encoding space markers (e.g. Ġ / Ċ)
         for (int i = 0; t[i] != '\0'; i++) {
-            if ((unsigned char)t[i] == 0xc4 && (unsigned char)t[i+1] == 0xa0) { // Ġ
-                printf(" ");
+            // Handle Tiktoken / BPE leading space marker \u0120 (0xc4 0xa0 in UTF-8)
+            if ((unsigned char)t[i] == 0xc4 && (unsigned char)t[i+1] == 0xa0) {
+                putchar(' ');
                 i++;
-            } else if ((unsigned char)t[i] == 0xc4 && (unsigned char)t[i+1] == 0x8a) { // Ċ
-                printf("\n");
+            } else if ((unsigned char)t[i] == 0xc4 && (unsigned char)t[i+1] == 0x8a) { // \u010a (newline)
+                putchar('\n');
                 i++;
             } else {
                 putchar(t[i]);
             }
         }
     } else if (token_id >= 32 && token_id <= 126) {
-        printf("%c", (char)token_id);
+        putchar((char)token_id);
     } else if (token_id == 10 || token_id == 13) {
-        printf("\n");
-    } else {
-        printf(" ");
+        putchar('\n');
     }
     fflush(stdout);
 }
