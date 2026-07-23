@@ -92,6 +92,8 @@ typedef struct {
     QwenQT g_proj;      /* Output gate projection */
     QwenQT a_proj;      /* Dynamic beta projection (32 x hidden_dim) */
     float *dt_bias;     /* Head-wise dt bias [32] */
+    float *conv1d_weight; /* 1D Causal Convolution weights [8192, 4] */
+    float *conv1d_state;  /* 1D Causal Convolution ring buffer [8192, 4] */
     QwenQT out_proj;    /* Final output projection */
 } QwenGatedDeltaNet;
 

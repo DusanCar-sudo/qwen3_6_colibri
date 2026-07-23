@@ -370,7 +370,9 @@ int qwen_deltanet_init(QwenGatedDeltaNet *dn, int hidden, int num_heads, int hea
     size_t state_elems = (size_t)num_heads * head_dim * head_dim;
     dn->state_matrix = (float*)calloc(state_elems, sizeof(float));
     dn->dt_bias = (float*)calloc(32, sizeof(float));
-    if (!dn->state_matrix || !dn->dt_bias) return -1;
+    dn->conv1d_weight = (float*)calloc(8192 * 4, sizeof(float));
+    dn->conv1d_state = (float*)calloc(8192 * 4, sizeof(float));
+    if (!dn->state_matrix || !dn->dt_bias || !dn->conv1d_weight || !dn->conv1d_state) return -1;
 
     return 0;
 }
@@ -379,8 +381,12 @@ void qwen_deltanet_free(QwenGatedDeltaNet *dn) {
     if (dn) {
         if (dn->state_matrix) free(dn->state_matrix);
         if (dn->dt_bias) free(dn->dt_bias);
+        if (dn->conv1d_weight) free(dn->conv1d_weight);
+        if (dn->conv1d_state) free(dn->conv1d_state);
         dn->state_matrix = NULL;
         dn->dt_bias = NULL;
+        dn->conv1d_weight = NULL;
+        dn->conv1d_state = NULL;
     }
 }
 
@@ -388,12 +394,37 @@ void qwen_deltanet_forward(QwenGatedDeltaNet *dn, const float *x, float *out) {
     int NH = dn->num_heads;
     int HD = dn->head_dim;
 
-    float q[2048], k[2048], v[4096], g[4096], a[32];
-    qwen_matmul_qt(x, &dn->q_proj, q, 1);
-    qwen_matmul_qt(x, &dn->k_proj, k, 1);
-    qwen_matmul_qt(x, &dn->v_proj, v, 1);
+    float raw_q[2048], raw_k[2048], raw_v[4096], g[4096], a[32];
+    qwen_matmul_qt(x, &dn->q_proj, raw_q, 1);
+    qwen_matmul_qt(x, &dn->k_proj, raw_k, 1);
+    qwen_matmul_qt(x, &dn->v_proj, raw_v, 1);
     qwen_matmul_qt(x, &dn->g_proj, g, 1);
     qwen_matmul_qt(x, &dn->a_proj, a, 1);
+
+    /* 1D Causal Depthwise Convolution across Q (2048), K (2048), V (4096) = 8192 channels */
+    float qkv_in[8192];
+    memcpy(qkv_in, raw_q, 2048 * sizeof(float));
+    memcpy(qkv_in + 2048, raw_k, 2048 * sizeof(float));
+    memcpy(qkv_in + 4096, raw_v, 4096 * sizeof(float));
+
+    float qkv_conv[8192];
+    for (int c = 0; c < 8192; c++) {
+        /* Shift ring buffer left */
+        dn->conv1d_state[c * 4 + 0] = dn->conv1d_state[c * 4 + 1];
+        dn->conv1d_state[c * 4 + 1] = dn->conv1d_state[c * 4 + 2];
+        dn->conv1d_state[c * 4 + 2] = dn->conv1d_state[c * 4 + 3];
+        dn->conv1d_state[c * 4 + 3] = qkv_in[c];
+
+        float sum = 0.0f;
+        for (int k = 0; k < 4; k++) {
+            sum += dn->conv1d_state[c * 4 + k] * dn->conv1d_weight[c * 4 + k];
+        }
+        qkv_conv[c] = silu(sum);
+    }
+
+    const float *q = qkv_conv;
+    const float *k = qkv_conv + 2048;
+    const float *v = qkv_conv + 4096;
 
     float attn_out[4096];
 
@@ -644,6 +675,7 @@ int qwen_model_load_backbone(Qwen3_6Model *model, const char *backbone_path) {
         nread += fread(buf_g, sizeof(float), 4096 * h_d, f);
         nread += fread(buf_a, sizeof(float), 32 * h_d, f);
         nread += fread(layer->deltanet.dt_bias, sizeof(float), 32, f);
+        nread += fread(layer->deltanet.conv1d_weight, sizeof(float), 8192 * 4, f);
         nread += fread(buf_out, sizeof(float), h_d * 4096, f);
 
         qwen_qt_init_f32(&layer->deltanet.q_proj, h_d, h_d, buf_q);

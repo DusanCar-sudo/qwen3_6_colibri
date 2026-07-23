@@ -262,12 +262,15 @@ def convert_model(model_dir: Path, out_dir: Path, ebits: int = 8):
             a_w = state_dict.get(f"{p}.linear_attn.in_proj_a.weight", torch.zeros(32, hidden_dim)).float().numpy()
             dt_b = state_dict.get(f"{p}.linear_attn.dt_bias", torch.zeros(32)).float().numpy()
 
+            conv_w = state_dict.get(f"{p}.linear_attn.conv1d.weight", torch.zeros(8192, 1, 4)).float().numpy()
+
             f_bb.write(q_w.tobytes())
             f_bb.write(k_w.tobytes())
             f_bb.write(v_w.tobytes())
             f_bb.write(z.tobytes())
             f_bb.write(a_w.tobytes())
             f_bb.write(dt_b.tobytes())
+            f_bb.write(conv_w.tobytes())
             f_bb.write(out.tobytes())
 
             post_norm = state_dict.get(f"{p}.post_attention_layernorm.weight", torch.ones(hidden_dim)).float().numpy()
