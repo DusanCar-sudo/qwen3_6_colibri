@@ -422,6 +422,11 @@ void qwen_deltanet_forward(QwenGatedDeltaNet *dn, const float *x, float *out) {
     }
 
     qwen_matmul_qt(attn_out, &dn->out_proj, out, 1);
+
+    /* Residual pass through */
+    for (int i = 0; i < dn->hidden_dim; i++) {
+        out[i] += x[i];
+    }
 }
 
 /* Layer Initialization & Forward Pipeline */
