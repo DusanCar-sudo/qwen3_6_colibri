@@ -385,19 +385,19 @@ void qwen_deltanet_forward(QwenGatedDeltaNet *dn, const float *x, float *out) {
     int NH = dn->num_heads;
     int HD = dn->head_dim;
 
-    float q[2048], k[2048], v[2048], g[2048], beta[2048];
+    float q[2048], k[2048], v[4096], g[4096], beta[2048];
     qwen_matmul_qt(x, &dn->q_proj, q, 1);
     qwen_matmul_qt(x, &dn->k_proj, k, 1);
     qwen_matmul_qt(x, &dn->v_proj, v, 1);
     qwen_matmul_qt(x, &dn->g_proj, g, 1);
     qwen_matmul_qt(x, &dn->beta_proj, beta, 1);
 
-    float attn_out[2048];
+    float attn_out[4096];
 
     for (int h = 0; h < NH; h++) {
         const float *qh = q + h * HD;
         const float *kh = k + h * HD;
-        const float *vh = v + h * HD;
+        const float *vh = v + h * (HD * 2);
         float b_val = sigmoid(beta[h * HD]);
         float *S_h = dn->state_matrix + h * HD * HD;
 
@@ -410,14 +410,14 @@ void qwen_deltanet_forward(QwenGatedDeltaNet *dn, const float *x, float *out) {
         }
 
         /* Recurrence Query Matrix Vector Multiplication: y = S_t * q */
-        float *yh = attn_out + h * HD;
-        for (int r = 0; r < HD; r++) {
+        float *yh = attn_out + h * (HD * 2);
+        for (int r = 0; r < HD * 2; r++) {
             float sum = 0.0f;
             for (int c = 0; c < HD; c++) {
-                sum += S_h[r * HD + c] * qh[c];
+                sum += S_h[(r % HD) * HD + c] * qh[c];
             }
             /* Gated linear output: y * silu(gate) */
-            yh[r] = sum * silu(g[h * HD + r]);
+            yh[r] = sum * silu(g[h * (HD * 2) + r]);
         }
     }
 
