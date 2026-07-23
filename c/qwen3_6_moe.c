@@ -621,25 +621,25 @@ int qwen_model_load_backbone(Qwen3_6Model *model, const char *backbone_path) {
 
         float *buf_q = (float*)malloc(h_d * h_d * sizeof(float));
         float *buf_k = (float*)malloc(h_d * h_d * sizeof(float));
-        float *buf_v = (float*)malloc(h_d * h_d * sizeof(float));
-        float *buf_g = (float*)malloc(h_d * h_d * sizeof(float));
+        float *buf_v = (float*)malloc(4096 * h_d * sizeof(float));
+        float *buf_z = (float*)malloc(4096 * h_d * sizeof(float));
         float *buf_beta = (float*)malloc(h_d * h_d * sizeof(float));
-        float *buf_out = (float*)malloc(h_d * h_d * sizeof(float));
+        float *buf_out = (float*)malloc(h_d * 4096 * sizeof(float));
 
         size_t nread = 0;
         nread += fread(buf_q, sizeof(float), h_d * h_d, f);
         nread += fread(buf_k, sizeof(float), h_d * h_d, f);
-        nread += fread(buf_v, sizeof(float), h_d * h_d, f);
-        nread += fread(buf_g, sizeof(float), h_d * h_d, f);
+        nread += fread(buf_v, sizeof(float), 4096 * h_d, f);
+        nread += fread(buf_z, sizeof(float), 4096 * h_d, f);
         nread += fread(buf_beta, sizeof(float), h_d * h_d, f);
-        nread += fread(buf_out, sizeof(float), h_d * h_d, f);
+        nread += fread(buf_out, sizeof(float), h_d * 4096, f);
 
         qwen_qt_init_f32(&layer->deltanet.q_proj, h_d, h_d, buf_q);
         qwen_qt_init_f32(&layer->deltanet.k_proj, h_d, h_d, buf_k);
-        qwen_qt_init_f32(&layer->deltanet.v_proj, h_d, h_d, buf_v);
-        qwen_qt_init_f32(&layer->deltanet.g_proj, h_d, h_d, buf_g);
+        qwen_qt_init_f32(&layer->deltanet.v_proj, 4096, h_d, buf_v);
+        qwen_qt_init_f32(&layer->deltanet.g_proj, 4096, h_d, buf_z);
         qwen_qt_init_f32(&layer->deltanet.beta_proj, h_d, h_d, buf_beta);
-        qwen_qt_init_f32(&layer->deltanet.out_proj, h_d, h_d, buf_out);
+        qwen_qt_init_f32(&layer->deltanet.out_proj, h_d, 4096, buf_out);
 
         nread += fread(layer->post_attn_layernorm, sizeof(float), h_d, f);
         nread += fread(layer->q_norm, sizeof(float), 256, f);
